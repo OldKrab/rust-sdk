@@ -243,7 +243,7 @@ where
     /// The vector `dynamic_handler_registrations` contains any dynamic
     /// handle registrations associated with this session (e.g., from MCP servers).
     /// You can simply pass `Default::default()` if not applicable.
-    pub(crate) fn attach_session<'runner>(
+    pub fn attach_session<'runner>(
         &self,
         response: NewSessionResponse,
         mcp_handler_registrations: Vec<DynamicHandlerGuard<Counterpart>>,
