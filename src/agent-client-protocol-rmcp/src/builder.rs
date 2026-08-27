@@ -1,6 +1,6 @@
 //! MCP server builder for creating MCP servers.
 
-use std::{marker::PhantomData, pin::pin, sync::Arc};
+use std::{future::Future, marker::PhantomData, pin::pin, sync::Arc};
 
 use futures::future::{BoxFuture, Either};
 use futures_concurrency::future::TryJoin;
@@ -44,14 +44,14 @@ use agent_client_protocol::{
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct McpServerBuilder<Counterpart: Role, Responder>
+pub struct McpServerBuilder<Counterpart: Role, Runner>
 where
-    Responder: RunWithConnectionTo<Counterpart>,
+    Runner: RunWithConnectionTo<Counterpart>,
 {
     phantom: PhantomData<Counterpart>,
     name: String,
     data: McpToolRegistry<Counterpart>,
-    responder: Responder,
+    runner: Runner,
 }
 
 impl<Counterpart: Role> McpServerBuilder<Counterpart, NullRun> {
@@ -60,14 +60,14 @@ impl<Counterpart: Role> McpServerBuilder<Counterpart, NullRun> {
             name,
             phantom: PhantomData,
             data: McpToolRegistry::default(),
-            responder: NullRun,
+            runner: NullRun,
         }
     }
 }
 
-impl<Counterpart: Role, Responder> McpServerBuilder<Counterpart, Responder>
+impl<Counterpart: Role, Runner> McpServerBuilder<Counterpart, Runner>
 where
-    Responder: RunWithConnectionTo<Counterpart>,
+    Runner: RunWithConnectionTo<Counterpart>,
 {
     /// Set the server instructions that are provided to the client.
     #[must_use]
@@ -115,19 +115,19 @@ where
         Ok(self)
     }
 
-    /// Private fn: adds the tool but also adds a responder that will be
+    /// Private fn: adds the tool but also adds a runner that will be
     /// run while the MCP server is active.
-    fn tool_with_responder(
+    fn tool_with_runner(
         self,
         tool: impl McpTool<Counterpart> + 'static,
-        tool_responder: impl RunWithConnectionTo<Counterpart>,
+        tool_runner: impl RunWithConnectionTo<Counterpart>,
     ) -> McpServerBuilder<Counterpart, impl RunWithConnectionTo<Counterpart>> {
         let this = self.tool(tool);
         McpServerBuilder {
             phantom: PhantomData,
             name: this.name,
             data: this.data,
-            responder: ChainRun::new(this.responder, tool_responder),
+            runner: ChainRun::new(this.runner, tool_runner),
         }
     }
 
@@ -171,9 +171,9 @@ where
         Ret: JsonSchema + Serialize + 'static + Send,
         F: AsyncFnMut(P, McpConnectionTo<Counterpart>) -> Result<Ret, acp::Error> + Send,
     {
-        let (tool, responder) =
+        let (tool, runner) =
             acp::mcp_server::tool_fn_mut(name, description, func, tool_future_hack);
-        self.tool_with_responder(tool, responder)
+        self.tool_with_runner(tool, runner)
     }
 
     /// Convenience wrapper for defining a stateless tool that can run concurrently.
@@ -218,21 +218,22 @@ where
             + Sync
             + 'static,
     {
-        let (tool, responder) = acp::mcp_server::tool_fn(name, description, func, tool_future_hack);
-        self.tool_with_responder(tool, responder)
+        let (tool, runner) = acp::mcp_server::tool_fn(name, description, func, tool_future_hack);
+        self.tool_with_runner(tool, runner)
     }
 
     /// Create an MCP server from this builder.
     ///
-    /// This builder can be attached to new sessions (see [`SessionBuilder::with_mcp_server`](`agent_client_protocol::SessionBuilder::with_mcp_server`))
-    /// or served up as part of a proxy (see [`Builder::with_mcp_server`](`agent_client_protocol::Builder::with_mcp_server`)).
-    pub fn build(self) -> McpServer<Counterpart, Responder> {
+    /// This builder can be served directly. With the `unstable_mcp_over_acp`
+    /// feature, it can also be attached through
+    /// `SessionBuilder::with_mcp_server` or `Builder::with_mcp_server`.
+    pub fn build(self) -> McpServer<Counterpart, Runner> {
         McpServer::new(
             McpServerBuilt {
                 name: self.name,
                 data: Arc::new(self.data),
             },
-            self.responder,
+            self.runner,
         )
     }
 }
@@ -258,7 +259,7 @@ impl<Counterpart: Role> McpServerConnect<Counterpart> for McpServerBuilt<Counter
     }
 }
 
-/// An MCP server instance connected to the ACP framework.
+/// A connected MCP server instance.
 pub(crate) struct McpServerConnection<Counterpart: Role> {
     data: Arc<McpToolRegistry<Counterpart>>,
     mcp_connection: McpConnectionTo<Counterpart>,
@@ -329,9 +330,9 @@ impl<R: Role> ServerHandler for McpServerConnection<R> {
                     if has_structured_output {
                         Ok(CallToolResult::structured(result))
                     } else {
-                        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                            result.to_string(),
-                        )]))
+                        Ok(CallToolResult::success(vec![
+                            rmcp::model::ContentBlock::text(result.to_string()),
+                        ]))
                     }
                 }
                 Err(error) => Err(to_rmcp_error(error)),
@@ -344,18 +345,18 @@ impl<R: Role> ServerHandler for McpServerConnection<R> {
         }
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>> + Send {
         // Return only enabled tools
         let tools: Vec<_> = self
             .data
             .enabled_tools()
             .map(|tool| make_tool_model(tool.metadata()))
             .collect();
-        Ok(ListToolsResult::with_all_items(tools))
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
     }
 
     fn get_info(&self) -> rmcp::model::ServerInfo {

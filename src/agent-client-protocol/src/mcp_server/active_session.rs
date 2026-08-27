@@ -1,73 +1,261 @@
+use std::{marker::PhantomData, sync::Arc};
+
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 use rustc_hash::FxHashMap;
+use serde_json::{Map, Value};
 
-use crate::mcp_server::{McpConnectionTo, McpServerConnect};
+use crate::mcp_server::{McpConnectionContext, McpConnectionTo, McpServerConnect};
 use crate::role;
 use crate::role::HasPeer;
-use crate::schema::{
-    McpConnectRequest, McpConnectResponse, McpDisconnectNotification, McpOverAcpMessage,
+use crate::schema::v1::{
+    ConnectMcpRequest, ConnectMcpResponse, DisconnectMcpRequest, DisconnectMcpResponse,
+    McpConnectionId, McpServerAcpId, MessageMcpNotification, MessageMcpRequest, MessageMcpResponse,
 };
 use crate::util::MatchDispatchFrom;
 use crate::{
-    Agent, Channel, ConnectTo, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, Responder,
-    Role, UntypedMessage,
+    Agent, Channel, ConnectTo, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Responder, Role, UntypedMessage,
 };
-use std::sync::Arc;
 
-/// The message handler for an MCP server offered to a particular session.
-/// This is added as a 'dynamic' handler to the connection context
-/// (see [`ConnectionTo::add_dynamic_handler`]) and handles MCP-over-ACP messages
-/// with the appropriate ACP url.
-pub(super) struct McpActiveSession<Counterpart: Role> {
-    /// The ACP identifier created for this session
-    acp_id: String,
+/// Stable protocol v1 native MCP-over-ACP wire types.
+pub(super) struct V1McpProtocol;
 
-    /// The MCP server we are managing
-    mcp_connect: Arc<dyn McpServerConnect<Counterpart>>,
+/// Draft protocol v2 native MCP-over-ACP wire types.
+#[cfg(feature = "unstable_protocol_v2")]
+pub(super) struct V2McpProtocol;
 
-    /// Active connections to MCP server tasks
-    connections: FxHashMap<String, mpsc::Sender<Dispatch>>,
+pub(super) struct McpMessage {
+    method: String,
+    params: Option<Map<String, Value>>,
 }
 
-impl<Counterpart: Role> McpActiveSession<Counterpart>
-where
-    Counterpart: HasPeer<Agent>,
-{
-    pub fn new(acp_id: String, mcp_connect: Arc<dyn McpServerConnect<Counterpart>>) -> Self {
-        Self {
-            acp_id,
-            mcp_connect,
-            connections: FxHashMap::default(),
+pub(super) trait McpProtocol: Send + 'static {
+    type ConnectRequest: JsonRpcRequest<Response = Self::ConnectResponse>;
+    type ConnectResponse: JsonRpcResponse;
+    type MessageRequest: JsonRpcRequest<Response = Self::MessageResponse>;
+    type MessageNotification: JsonRpcNotification;
+    type MessageResponse: JsonRpcResponse;
+    type DisconnectRequest: JsonRpcRequest<Response = Self::DisconnectResponse>;
+    type DisconnectResponse: JsonRpcResponse;
+
+    fn connect_server_id(request: &Self::ConnectRequest) -> McpServerAcpId;
+    fn connect_response(connection_id: McpConnectionId) -> Self::ConnectResponse;
+    fn message_request(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageRequest;
+    fn message_notification(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageNotification;
+    fn message_request_connection_id(request: &Self::MessageRequest) -> McpConnectionId;
+    fn message_notification_connection_id(
+        notification: &Self::MessageNotification,
+    ) -> McpConnectionId;
+    fn into_message_request(request: Self::MessageRequest) -> McpMessage;
+    fn into_message_notification(notification: Self::MessageNotification) -> McpMessage;
+    fn disconnect_connection_id(request: &Self::DisconnectRequest) -> McpConnectionId;
+    fn disconnect_response() -> Self::DisconnectResponse;
+}
+
+impl McpProtocol for V1McpProtocol {
+    type ConnectRequest = ConnectMcpRequest;
+    type ConnectResponse = ConnectMcpResponse;
+    type MessageRequest = MessageMcpRequest;
+    type MessageNotification = MessageMcpNotification;
+    type MessageResponse = MessageMcpResponse;
+    type DisconnectRequest = DisconnectMcpRequest;
+    type DisconnectResponse = DisconnectMcpResponse;
+
+    fn connect_server_id(request: &Self::ConnectRequest) -> McpServerAcpId {
+        request.server_id.clone()
+    }
+
+    fn connect_response(connection_id: McpConnectionId) -> Self::ConnectResponse {
+        ConnectMcpResponse::new(connection_id)
+    }
+
+    fn message_request(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageRequest {
+        MessageMcpRequest::new(connection_id, method).params(params)
+    }
+
+    fn message_notification(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageNotification {
+        MessageMcpNotification::new(connection_id, method).params(params)
+    }
+
+    fn message_request_connection_id(request: &Self::MessageRequest) -> McpConnectionId {
+        request.connection_id.clone()
+    }
+
+    fn message_notification_connection_id(
+        notification: &Self::MessageNotification,
+    ) -> McpConnectionId {
+        notification.connection_id.clone()
+    }
+
+    fn into_message_request(request: Self::MessageRequest) -> McpMessage {
+        McpMessage {
+            method: request.method,
+            params: request.params,
         }
     }
 
-    /// Handle connection requests for our MCP server by creating a new connection.
-    /// A *connection* is an actual running instance of this MCP server.
+    fn into_message_notification(notification: Self::MessageNotification) -> McpMessage {
+        McpMessage {
+            method: notification.method,
+            params: notification.params,
+        }
+    }
+
+    fn disconnect_connection_id(request: &Self::DisconnectRequest) -> McpConnectionId {
+        request.connection_id.clone()
+    }
+
+    fn disconnect_response() -> Self::DisconnectResponse {
+        DisconnectMcpResponse::new()
+    }
+}
+
+#[cfg(feature = "unstable_protocol_v2")]
+impl McpProtocol for V2McpProtocol {
+    type ConnectRequest = crate::schema::v2::ConnectMcpRequest;
+    type ConnectResponse = crate::schema::v2::ConnectMcpResponse;
+    type MessageRequest = crate::schema::v2::MessageMcpRequest;
+    type MessageNotification = crate::schema::v2::MessageMcpNotification;
+    type MessageResponse = crate::schema::v2::MessageMcpResponse;
+    type DisconnectRequest = crate::schema::v2::DisconnectMcpRequest;
+    type DisconnectResponse = crate::schema::v2::DisconnectMcpResponse;
+
+    fn connect_server_id(request: &Self::ConnectRequest) -> McpServerAcpId {
+        McpServerAcpId::new(request.server_id.0.clone())
+    }
+
+    fn connect_response(connection_id: McpConnectionId) -> Self::ConnectResponse {
+        crate::schema::v2::ConnectMcpResponse::new(connection_id.0)
+    }
+
+    fn message_request(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageRequest {
+        crate::schema::v2::MessageMcpRequest::new(connection_id.0, method).params(params)
+    }
+
+    fn message_notification(
+        connection_id: McpConnectionId,
+        method: String,
+        params: Option<Map<String, Value>>,
+    ) -> Self::MessageNotification {
+        crate::schema::v2::MessageMcpNotification::new(connection_id.0, method).params(params)
+    }
+
+    fn message_request_connection_id(request: &Self::MessageRequest) -> McpConnectionId {
+        McpConnectionId::new(request.connection_id.0.clone())
+    }
+
+    fn message_notification_connection_id(
+        notification: &Self::MessageNotification,
+    ) -> McpConnectionId {
+        McpConnectionId::new(notification.connection_id.0.clone())
+    }
+
+    fn into_message_request(request: Self::MessageRequest) -> McpMessage {
+        McpMessage {
+            method: request.method,
+            params: request.params,
+        }
+    }
+
+    fn into_message_notification(notification: Self::MessageNotification) -> McpMessage {
+        McpMessage {
+            method: notification.method,
+            params: notification.params,
+        }
+    }
+
+    fn disconnect_connection_id(request: &Self::DisconnectRequest) -> McpConnectionId {
+        McpConnectionId::new(request.connection_id.0.clone())
+    }
+
+    fn disconnect_response() -> Self::DisconnectResponse {
+        crate::schema::v2::DisconnectMcpResponse::new()
+    }
+}
+
+/// The message handler for an MCP server offered to a particular session.
+/// This is added as a dynamic handler to the connection context and handles
+/// native MCP-over-ACP messages for the declared server ID.
+pub(super) struct McpActiveSession<Counterpart: Role, Protocol = V1McpProtocol> {
+    /// The opaque ACP transport identifier for this MCP server.
+    server_id: McpServerAcpId,
+
+    /// The MCP server we are managing.
+    mcp_connect: Arc<dyn McpServerConnect<Counterpart>>,
+
+    /// Active connections to MCP server tasks.
+    connections: FxHashMap<McpConnectionId, mpsc::Sender<Dispatch>>,
+
+    protocol: PhantomData<fn() -> Protocol>,
+}
+
+impl<Counterpart: Role, Protocol> McpActiveSession<Counterpart, Protocol>
+where
+    Counterpart: HasPeer<Agent>,
+    Protocol: McpProtocol,
+{
+    pub fn new(
+        server_id: McpServerAcpId,
+        mcp_connect: Arc<dyn McpServerConnect<Counterpart>>,
+    ) -> Self {
+        Self {
+            server_id,
+            mcp_connect,
+            connections: FxHashMap::default(),
+            protocol: PhantomData,
+        }
+    }
+
+    /// Handle a connection request for our MCP server by creating a new MCP connection.
     fn handle_connect_request(
         &mut self,
-        request: McpConnectRequest,
-        responder: Responder<McpConnectResponse>,
+        request: Protocol::ConnectRequest,
+        responder: Responder<Protocol::ConnectResponse>,
         acp_connection: &ConnectionTo<Counterpart>,
-    ) -> Result<Handled<(McpConnectRequest, Responder<McpConnectResponse>)>, crate::Error> {
-        // Check that this is for our MCP server
-        if request.acp_id != self.acp_id {
+    ) -> Result<
+        Handled<(
+            Protocol::ConnectRequest,
+            Responder<Protocol::ConnectResponse>,
+        )>,
+        crate::Error,
+    > {
+        let server_id = Protocol::connect_server_id(&request);
+        if server_id != self.server_id {
             return Ok(Handled::No {
                 message: (request, responder),
                 retry: false,
             });
         }
 
-        // Create a unique connection ID and a channel for future communication
-        let connection_id = format!("mcp-over-acp-connection:{}", uuid::Uuid::new_v4());
+        let connection_id =
+            McpConnectionId::new(format!("mcp-over-acp-connection:{}", uuid::Uuid::new_v4()));
         let (mcp_server_tx, mut mcp_server_rx) = mpsc::channel(128);
         self.connections
             .insert(connection_id.clone(), mcp_server_tx);
 
-        // Create connected channel pair for client-server communication
         let (client_channel, server_channel) = Channel::duplex();
 
-        // Create client-side handler that wraps messages and forwards to successor
         let client_component = {
             let connection_id = connection_id.clone();
             let acp_connection = acp_connection.clone();
@@ -75,142 +263,182 @@ where
             role::mcp::Client
                 .builder()
                 .on_receive_dispatch(
-                    async move |message: Dispatch, _mcp_connection| {
-                        // Wrap the message in McpOverAcp{Request,Notification} and forward to successor
-                        let wrapped = message.map(
-                            |request, responder| {
-                                (
-                                    McpOverAcpMessage {
-                                        connection_id: connection_id.clone(),
-                                        message: request,
-                                        meta: None,
-                                    },
-                                    responder,
-                                )
-                            },
-                            |notification| McpOverAcpMessage {
-                                connection_id: connection_id.clone(),
-                                message: notification,
-                                meta: None,
-                            },
-                        );
-                        acp_connection.send_proxied_message_to(Agent, wrapped)
+                    async move |message: Dispatch, _mcp_connection| match message {
+                        Dispatch::Request(request, responder) => {
+                            let (method, params) = request.into_parts();
+                            let params = match into_native_params(params) {
+                                Ok(params) => params,
+                                Err(error) => return responder.respond_with_error(error),
+                            };
+                            let request =
+                                Protocol::message_request(connection_id.clone(), method, params);
+                            let responder = responder.wrap_params(|method, result| {
+                                result.and_then(|response: Protocol::MessageResponse| {
+                                    response.into_json(method)
+                                })
+                            });
+                            let message: Dispatch<
+                                Protocol::MessageRequest,
+                                Protocol::MessageNotification,
+                            > = Dispatch::Request(request, responder);
+                            acp_connection.send_proxied_message_to(Agent, message)
+                        }
+                        Dispatch::Notification(notification) => {
+                            let (method, params) = notification.into_parts();
+                            let params = match into_native_params(params) {
+                                Ok(params) => params,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        ?error,
+                                        "ignoring MCP notification with positional parameters"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                            let notification = Protocol::message_notification(
+                                connection_id.clone(),
+                                method,
+                                params,
+                            );
+                            let message: Dispatch<
+                                Protocol::MessageRequest,
+                                Protocol::MessageNotification,
+                            > = Dispatch::Notification(notification);
+                            acp_connection.send_proxied_message_to(Agent, message)
+                        }
+                        Dispatch::Response(result, router) => router.route_with_result(result),
                     },
                     crate::on_receive_dispatch!(),
                 )
                 .with_spawned(move |mcp_connection| async move {
-                    // Messages we pull off this channel were sent from the agent.
-                    // Forward them back to the MCP server.
-                    while let Some(msg) = mcp_server_rx.next().await {
-                        mcp_connection.send_proxied_message_to(role::mcp::Server, msg)?;
+                    // These messages were sent by the ACP agent. Forward them to the MCP server.
+                    while let Some(message) = mcp_server_rx.next().await {
+                        mcp_connection.send_proxied_message_to(role::mcp::Server, message)?;
                     }
                     Ok(())
                 })
         };
 
-        // Get the MCP server component
         let spawned_server = self.mcp_connect.connect(McpConnectionTo {
-            acp_id: request.acp_id.clone(),
+            context: McpConnectionContext::Acp {
+                server_id,
+                connection_id: connection_id.clone(),
+            },
             connection: acp_connection.clone(),
         });
 
-        // Spawn both sides of the connection
         let spawn_results = acp_connection
             .spawn(async move { client_component.connect_to(client_channel).await })
             .and_then(|()| {
-                // Spawn the MCP server serving the server channel
                 acp_connection.spawn(async move { spawned_server.connect_to(server_channel).await })
             });
 
         match spawn_results {
             Ok(()) => {
-                responder.respond(McpConnectResponse {
-                    connection_id,
-                    meta: None,
-                })?;
+                responder.respond(Protocol::connect_response(connection_id))?;
                 Ok(Handled::Yes)
             }
-
-            Err(err) => {
-                responder.respond_with_error(err)?;
+            Err(error) => {
+                self.connections.remove(&connection_id);
+                responder.respond_with_error(error)?;
                 Ok(Handled::Yes)
             }
         }
     }
 
-    /// Forward MCP-over-ACP requests to the connection.
+    /// Forward a native MCP-over-ACP request to its MCP connection.
     async fn handle_mcp_over_acp_request(
         &mut self,
-        request: McpOverAcpMessage<UntypedMessage>,
-        responder: Responder<serde_json::Value>,
+        request: Protocol::MessageRequest,
+        responder: Responder<Protocol::MessageResponse>,
     ) -> Result<
         Handled<(
-            McpOverAcpMessage<UntypedMessage>,
-            Responder<serde_json::Value>,
+            Protocol::MessageRequest,
+            Responder<Protocol::MessageResponse>,
         )>,
         crate::Error,
     > {
-        // Check if we have a registered server with the given URL. If not, don't try to handle the request.
-        let Some(mcp_server_tx) = self.connections.get_mut(&request.connection_id) else {
+        let connection_id = Protocol::message_request_connection_id(&request);
+        let Some(mcp_server_tx) = self.connections.get_mut(&connection_id) else {
             return Ok(Handled::No {
                 message: (request, responder),
                 retry: false,
             });
         };
+        let message = Protocol::into_message_request(request);
 
+        let untyped = UntypedMessage {
+            method: message.method,
+            params: native_params_into_value(message.params),
+        };
+        let responder = responder.wrap_params(|method, result| {
+            result
+                .and_then(|response: Value| Protocol::MessageResponse::from_value(method, response))
+        });
         mcp_server_tx
-            .send(Dispatch::Request(request.message, responder))
+            .send(Dispatch::Request(untyped, responder))
             .await
             .map_err(crate::Error::into_internal_error)?;
 
         Ok(Handled::Yes)
     }
 
-    /// Forward MCP-over-ACP notifications to the connection.
+    /// Forward a native MCP-over-ACP notification to its MCP connection.
     async fn handle_mcp_over_acp_notification(
         &mut self,
-        notification: McpOverAcpMessage<UntypedMessage>,
-    ) -> Result<Handled<McpOverAcpMessage<UntypedMessage>>, crate::Error> {
-        // Check if we have a registered server with the given URL. If not, don't try to handle the request.
-        let Some(mcp_server_tx) = self.connections.get_mut(&notification.connection_id) else {
+        notification: Protocol::MessageNotification,
+    ) -> Result<Handled<Protocol::MessageNotification>, crate::Error> {
+        let connection_id = Protocol::message_notification_connection_id(&notification);
+        let Some(mcp_server_tx) = self.connections.get_mut(&connection_id) else {
             return Ok(Handled::No {
                 message: notification,
                 retry: false,
             });
         };
+        let message = Protocol::into_message_notification(notification);
 
+        let untyped = UntypedMessage {
+            method: message.method,
+            params: native_params_into_value(message.params),
+        };
         mcp_server_tx
-            .send(Dispatch::Notification(notification.message))
+            .send(Dispatch::Notification(untyped))
             .await
             .map_err(crate::Error::into_internal_error)?;
 
         Ok(Handled::Yes)
     }
 
-    /// Disconnect a connection.
-    fn handle_mcp_disconnect_notification(
+    /// Disconnect an active native MCP-over-ACP connection.
+    fn handle_mcp_disconnect_request(
         &mut self,
-        successor_notification: McpDisconnectNotification,
-    ) -> Handled<McpDisconnectNotification> {
-        // Remove connection if we have it. Otherwise, do not handle the notification.
-        if self
-            .connections
-            .remove(&successor_notification.connection_id)
-            .is_some()
-        {
-            Handled::Yes
-        } else {
-            Handled::No {
-                message: successor_notification,
+        request: Protocol::DisconnectRequest,
+        responder: Responder<Protocol::DisconnectResponse>,
+    ) -> Result<
+        Handled<(
+            Protocol::DisconnectRequest,
+            Responder<Protocol::DisconnectResponse>,
+        )>,
+        crate::Error,
+    > {
+        let connection_id = Protocol::disconnect_connection_id(&request);
+        if self.connections.remove(&connection_id).is_none() {
+            return Ok(Handled::No {
+                message: (request, responder),
                 retry: false,
-            }
+            });
         }
+
+        responder.respond(Protocol::disconnect_response())?;
+        Ok(Handled::Yes)
     }
 }
 
-impl<Counterpart: Role> HandleDispatchFrom<Counterpart> for McpActiveSession<Counterpart>
+impl<Counterpart: Role, Protocol> HandleDispatchFrom<Counterpart>
+    for McpActiveSession<Counterpart, Protocol>
 where
     Counterpart: HasPeer<Agent>,
+    Protocol: McpProtocol,
 {
     fn describe_chain(&self) -> impl std::fmt::Debug {
         "McpServerSession"
@@ -222,26 +450,76 @@ where
         connection: ConnectionTo<Counterpart>,
     ) -> Result<Handled<Dispatch>, crate::Error> {
         MatchDispatchFrom::new(message, &connection)
-            // MCP connect requests come from the Agent direction (wrapped in SuccessorMessage)
-            .if_request_from(Agent, async |request, responder| {
-                self.handle_connect_request(request, responder, &connection)
-            })
+            .if_request_from(
+                Agent,
+                async |request: Protocol::ConnectRequest, responder| {
+                    self.handle_connect_request(request, responder, &connection)
+                },
+            )
             .await
-            // MCP over ACP requests come from the Agent direction
-            .if_request_from(Agent, async |request, responder| {
-                self.handle_mcp_over_acp_request(request, responder).await
-            })
+            .if_request_from(
+                Agent,
+                async |request: Protocol::MessageRequest, responder| {
+                    self.handle_mcp_over_acp_request(request, responder).await
+                },
+            )
             .await
-            // MCP over ACP notifications come from the Agent direction
-            .if_notification_from(Agent, async |notification| {
-                self.handle_mcp_over_acp_notification(notification).await
-            })
+            .if_notification_from(
+                Agent,
+                async |notification: Protocol::MessageNotification| {
+                    self.handle_mcp_over_acp_notification(notification).await
+                },
+            )
             .await
-            // MCP disconnect notifications come from the Agent direction
-            .if_notification_from(Agent, async |notification| {
-                Ok(self.handle_mcp_disconnect_notification(notification))
-            })
+            .if_request_from(
+                Agent,
+                async |request: Protocol::DisconnectRequest, responder| {
+                    self.handle_mcp_disconnect_request(request, responder)
+                },
+            )
             .await
             .done()
+    }
+}
+
+fn into_native_params(params: Value) -> Result<Option<Map<String, Value>>, crate::Error> {
+    match params {
+        Value::Null => Ok(None),
+        Value::Object(params) => Ok(Some(params)),
+        Value::Array(_) => Err(crate::Error::invalid_params()
+            .data("MCP-over-ACP only supports named inner MCP parameters")),
+        _ => {
+            Err(crate::Error::invalid_params()
+                .data("inner MCP parameters must be an object or null"))
+        }
+    }
+}
+
+fn native_params_into_value(params: Option<Map<String, Value>>) -> Value {
+    params.map_or(Value::Null, Value::Object)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{into_native_params, native_params_into_value};
+
+    #[test]
+    fn native_mcp_params_round_trip_objects_and_null() {
+        let object = json!({ "name": "echo", "arguments": {} });
+        let params = into_native_params(object.clone()).expect("object params should be valid");
+        assert_eq!(native_params_into_value(params), object);
+
+        let params = into_native_params(serde_json::Value::Null)
+            .expect("omitted params should be represented as null");
+        assert_eq!(native_params_into_value(params), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn native_mcp_params_reject_positional_params() {
+        let error = into_native_params(json!(["positional"]))
+            .expect_err("native MCP-over-ACP cannot represent positional params");
+        assert_eq!(error.code, crate::ErrorCode::InvalidParams);
     }
 }

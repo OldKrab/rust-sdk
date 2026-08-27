@@ -1,7 +1,8 @@
 [package]
 name = "agent-client-protocol-conductor"
-version = "1.0.1"
+version = "2.0.0"
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,13 +17,10 @@ path = "src/main.rs"
 
 [features]
 default = []
-
-# Forwarded from agent-client-protocol. Enable to let the conductor forward
-# `$/cancel_request` hop by hop through the proxy chain.
-unstable_cancel_request = ["agent-client-protocol/unstable_cancel_request"]
+unstable_protocol_v2 = ["agent-client-protocol/unstable_protocol_v2"]
 
 [dependencies]
-agent-client-protocol = { workspace = true }
+agent-client-protocol = { workspace = true, features = ["unstable_mcp_over_acp"] }
 agent-client-protocol-trace-viewer.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
@@ -40,15 +38,20 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-agent-client-protocol = { workspace = true, features = ["unstable_mcp_over_acp"] }
 agent-client-protocol-rmcp.workspace = true
 agent-client-protocol-test.workspace = true
 yopo.workspace = true
 expect-test.workspace = true
 regex.workspace = true
-rmcp = { workspace = true, features = ["client", "server", "transport-io", "transport-child-process"] }
+rmcp = { workspace = true, features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 schemars.workspace = true
-agent-client-protocol-polyfill.workspace = true
+agent-client-protocol-polyfill = { workspace = true, features = ["unstable_protocol_v2"] }
 
 [lints]
 workspace = true

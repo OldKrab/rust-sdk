@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v2.0.1...agent-client-protocol-rmcp-v3.0.0) - 2026-07-23
+
+### Breaking changes
+
+- Use `agent-client-protocol-rmcp` 3.x with `agent-client-protocol` 2.x and `rmcp` 2.x. Both
+  dependencies appear in this crate's public API and must be migrated together.
+- Attached rmcp services now use native `McpServer::Acp` declarations, `mcp/connect`,
+  `mcp/message`, and request/response `mcp/disconnect`; optional typed `server_id` and
+  `connection_id` accessors replace `acp_id` in tool and connection contexts.
+  ([#281](https://github.com/agentclientprotocol/rust-sdk/pull/281))
+
+See the [core 2.0 migration guide](https://agentclientprotocol.github.io/rust-sdk/migration_v2.0.html)
+for the shared API changes.
+
+### Changed
+
+- Keep rmcp-backed standalone MCP servers independent of the
+  `unstable_mcp_over_acp` feature. Applications enable this crate's matching passthrough feature
+  only when attaching a server to ACP. ([#281](https://github.com/agentclientprotocol/rust-sdk/pull/281))
+
+### Documentation
+
+- Replace removed handler and `serve()` APIs in examples and document compatibility with both
+  public dependencies. ([#279](https://github.com/agentclientprotocol/rust-sdk/pull/279),
+  [#287](https://github.com/agentclientprotocol/rust-sdk/pull/287))
+
+## [2.0.1](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v2.0.0...agent-client-protocol-rmcp-v2.0.1) - 2026-07-20
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [2.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v1.1.0...agent-client-protocol-rmcp-v2.0.0) - 2026-07-07
+
+### Added
+
+- [**breaking**] *(deps)* bump rmcp from 1.8.0 to 2.1.0 ([#239](https://github.com/agentclientprotocol/rust-sdk/pull/239)) — `rmcp` is a public dependency; its 2.x types (e.g. `ContentBlock`) appear in this crate's API
+
 ## [1.0.1](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v1.0.0...agent-client-protocol-rmcp-v1.0.1) - 2026-06-29
 
 ### Other

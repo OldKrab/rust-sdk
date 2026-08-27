@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in protocol-v2 initialization for agent and nested proxy chains
+  through `unstable_protocol_v2`, including version-aware custom instantiator
+  methods, raw v2 session creation routing, and the conductor binary.
+
+## [2.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-conductor-v1.3.0...agent-client-protocol-conductor-v2.0.0) - 2026-07-23
+
+### Breaking changes
+
+- Upgrade to `agent-client-protocol` 2.x. Conductor components and the core
+  handlers/types they expose must be migrated together.
+- Rename the public `ConductorResponder` background task to `ConductorRunner`, matching the core
+  runner API it implements. ([#277](https://github.com/agentclientprotocol/rust-sdk/pull/277))
+
+See the [core 2.0 migration guide](https://agentclientprotocol.github.io/rust-sdk/migration_v2.0.html)
+for the shared API changes.
+
+### Changed
+
+- Enable the core SDK's draft native MCP-over-ACP support so traces classify `mcp/message`.
+  HTTP translation remains an explicit `agent-client-protocol-polyfill` proxy.
+  ([#281](https://github.com/agentclientprotocol/rust-sdk/pull/281))
+
+### Fixed
+
+- Preserve JSON-RPC batch framing when conductor tracing is enabled.
+  ([#275](https://github.com/agentclientprotocol/rust-sdk/pull/275))
+
+### Documentation
+
+- Update examples for the current conductor and RMCP APIs, removing references to the retired MCP
+  bridge CLI mode and `serve()` API. ([#287](https://github.com/agentclientprotocol/rust-sdk/pull/287))
+
+## [1.3.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-conductor-v1.2.0...agent-client-protocol-conductor-v1.3.0) - 2026-07-20
+
+### Other
+
+- *(deps)* bump the minor group with 14 updates ([#258](https://github.com/agentclientprotocol/rust-sdk/pull/258))
+
+## [1.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-conductor-v1.1.0...agent-client-protocol-conductor-v1.2.0) - 2026-07-07
+
+### Added
+
+- *(deps)* bump rmcp from 1.8.0 to 2.1.0 ([#239](https://github.com/agentclientprotocol/rust-sdk/pull/239))
+
+## [1.1.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-conductor-v1.0.1...agent-client-protocol-conductor-v1.1.0) - 2026-07-06
+
+### Added
+
+- *(acp)* Make request cancellation stable ([#242](https://github.com/agentclientprotocol/rust-sdk/pull/242))
+
 ## [1.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-conductor-v0.15.1...agent-client-protocol-conductor-v1.0.0) - 2026-06-24
 
 ### Added

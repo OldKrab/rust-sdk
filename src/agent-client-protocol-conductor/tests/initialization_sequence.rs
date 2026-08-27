@@ -152,10 +152,9 @@ async fn test_single_component_gets_initialize_request() -> Result<(), agent_cli
     // Single component (agent) should receive InitializeRequest - we use ElizaAgent
     // which properly handles InitializeRequest
     run_test_with_components(vec![], async |connection_to_editor| {
-        let init_response = recv(
-            connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::LATEST)),
-        )
-        .await;
+        let init_response =
+            recv(connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::V1)))
+                .await;
 
         assert!(
             init_response.is_ok(),
@@ -180,7 +179,7 @@ async fn test_two_components_proxy_gets_initialize_proxy()
         vec![InitComponent::new(&component1)],
         async |connection_to_editor| {
             let init_response = recv(
-                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::LATEST)),
+                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::V1)),
             )
             .await;
 
@@ -221,7 +220,7 @@ async fn test_three_components_all_proxies_get_initialize_proxy()
         ],
         async |connection_to_editor| {
             let init_response = recv(
-                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::LATEST)),
+                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::V1)),
             )
             .await;
 
@@ -313,6 +312,18 @@ async fn run_bad_proxy_test(
         .await
 }
 
+fn assert_initialize_proxy_rejection(error: &agent_client_protocol::Error) {
+    #[cfg(feature = "unstable_protocol_v2")]
+    let expected = "_proxy/initialize";
+    #[cfg(not(feature = "unstable_protocol_v2"))]
+    let expected = "initialize/proxy";
+
+    assert!(
+        error.to_string().contains(expected),
+        "error should mention {expected}: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_conductor_rejects_initialize_proxy_forwarded_to_agent()
 -> Result<(), agent_client_protocol::Error> {
@@ -323,15 +334,12 @@ async fn test_conductor_rejects_initialize_proxy_forwarded_to_agent()
         DynConnectTo::new(Testy::new()),
         async |connection_to_editor| {
             let init_response = recv(
-                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::LATEST)),
+                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::V1)),
             )
             .await;
 
             if let Err(err) = init_response {
-                assert!(
-                    err.to_string().contains("initialize/proxy"),
-                    "Error should mention initialize/proxy: {err:?}"
-                );
+                assert_initialize_proxy_rejection(&err);
             }
 
             Ok::<(), agent_client_protocol::Error>(())
@@ -341,12 +349,7 @@ async fn test_conductor_rejects_initialize_proxy_forwarded_to_agent()
 
     match result {
         Ok(()) => panic!("Expected error when proxy forwards InitializeProxyRequest to agent"),
-        Err(err) => {
-            assert!(
-                err.to_string().contains("initialize/proxy"),
-                "Error should mention initialize/proxy: {err:?}"
-            );
-        }
+        Err(err) => assert_initialize_proxy_rejection(&err),
     }
 
     Ok(())
@@ -365,16 +368,13 @@ async fn test_conductor_rejects_initialize_proxy_forwarded_to_proxy()
         DynConnectTo::new(Testy::new()), // Agent
         async |connection_to_editor| {
             let init_response = recv(
-                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::LATEST)),
+                connection_to_editor.send_request(InitializeRequest::new(ProtocolVersion::V1)),
             )
             .await;
 
             // The error may come through recv() or bubble up through the test harness
             if let Err(err) = init_response {
-                assert!(
-                    err.to_string().contains("initialize/proxy"),
-                    "Error should mention initialize/proxy: {err:?}"
-                );
+                assert_initialize_proxy_rejection(&err);
             }
 
             Ok::<(), agent_client_protocol::Error>(())
@@ -385,12 +385,7 @@ async fn test_conductor_rejects_initialize_proxy_forwarded_to_proxy()
     // The error might bubble up through run_test_with_components instead
     match result {
         Ok(()) => panic!("Expected error when proxy forwards InitializeProxyRequest to proxy"),
-        Err(err) => {
-            assert!(
-                err.to_string().contains("initialize/proxy"),
-                "Error should mention initialize/proxy: {err:?}"
-            );
-        }
+        Err(err) => assert_initialize_proxy_rejection(&err),
     }
 
     Ok(())

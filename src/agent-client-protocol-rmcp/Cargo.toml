@@ -1,7 +1,8 @@
 [package]
 name = "agent-client-protocol-rmcp"
-version = "1.0.1"
+version = "3.0.0"
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,6 +10,14 @@ homepage.workspace = true
 description = "rmcp integration for Agent Client Protocol MCP servers"
 keywords = ["acp", "agent", "proxy", "mcp", "rmcp"]
 categories = ["development-tools"]
+
+[features]
+default = []
+unstable_mcp_over_acp = ["agent-client-protocol/unstable_mcp_over_acp"]
+
+[[example]]
+name = "with_mcp_server"
+required-features = ["unstable_mcp_over_acp"]
 
 [dependencies]
 agent-client-protocol.workspace = true

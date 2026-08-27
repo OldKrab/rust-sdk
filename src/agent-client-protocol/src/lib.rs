@@ -18,8 +18,20 @@
 //! ## Quick Start: Connecting to an Agent
 //!
 //! The most common use case is connecting to an existing ACP agent as a client.
-//! Here's a minimal example that initializes a connection, creates a session,
-//! and sends a prompt:
+//! This example uses stable ACP protocol v1. The draft protocol v2 feature
+//! provides a command-only `V2Session` API and receives updates and interactive
+//! requests through typed connection handlers because prompt acceptance and
+//! inbound traffic are independent. With both v2 and MCP-over-ACP features,
+//! `Proxy.v2()` supports global MCP attachment, while `V2SessionBuilder` and
+//! `V2ResumeSessionBuilder` support per-session attachment plus non-blocking
+//! proxy setup. With `unstable_session_fork`, `V2ForkSessionBuilder` provides
+//! the same shape for forked sessions and uses the response's new session ID.
+//! Per-session MCP routes and runners are ready before a setup request is
+//! published, as is proxy session routing for resume replay; successful
+//! attachments remain active for the connection lifetime.
+//!
+//! Here's a minimal example that initializes a v1 connection, creates a
+//! session, and sends a prompt:
 //!
 //! ```no_run
 //! use agent_client_protocol::Client;
@@ -64,6 +76,20 @@
 //!
 //! [`agent_client_protocol_cookbook`]: https://docs.rs/agent-client-protocol-cookbook
 //!
+//! ## WASI
+//!
+//! The runtime-neutral protocol engine and transport abstractions compile for
+//! `wasm32-wasip1` and `wasm32-wasip2`. This crate does not provide a WASI
+//! executor or host I/O adapter. The native `AcpAgent` and `Stdio`
+//! implementations depend on process spawning and blocking-thread facilities,
+//! so they and `LineDirection` are not exported on these targets.
+//!
+//! Embedders provide their own runtime and transport. They can exchange
+//! `TransportFrame` values through `Channel`, newline-delimited JSON through
+//! `Lines`, or use `ByteStreams` with `futures::io::AsyncRead` and
+//! `AsyncWrite`. The embedding runtime must drive the resulting connection
+//! future.
+//!
 //! ## Core Concepts
 //!
 //! The [`concepts`] module provides detailed explanations of how agent-client-protocol works,
@@ -83,7 +109,7 @@ pub mod component;
 pub mod concepts;
 /// JSON-RPC connection and handler infrastructure
 mod jsonrpc;
-/// MCP server support for providing MCP tools over ACP
+/// Runtime-agnostic MCP server support, including optional attachment to ACP sessions.
 pub mod mcp_server;
 /// Role types for ACP connections
 pub mod role;
@@ -95,15 +121,20 @@ pub mod util;
 pub use capabilities::*;
 
 pub use jsonrpc::{
-    Builder, ByteStreams, Channel, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+    Builder, ByteStreams, Channel, ConnectionContext, ConnectionTo, Dispatch, DynamicHandlerGuard,
+    HandleConnectionClose, HandleDispatchFrom, Handled, INCOMING_TRANSPORT_CLOSED_REASON,
     IntoHandled, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Lines,
-    NullHandler, RawJsonRpcMessage, RawJsonRpcParams, Responder, ResponseRouter, SentRequest,
-    UntypedMessage,
+    NullClose, NullHandler, RawConnectionContext, RawJsonRpcMessage, RawJsonRpcParams, Responder,
+    ResponseRouter, SentRequest, TransportBatch, TransportBatchEntry, TransportFrame,
+    UntypedMessage, is_incoming_transport_closed,
     run::{ChainRun, NullRun, RunWithConnectionTo},
 };
-#[cfg(feature = "unstable_cancel_request")]
 pub use jsonrpc::{RequestCancellation, is_cancel_request_notification};
+#[cfg(feature = "unstable_protocol_v2")]
+pub use jsonrpc::{V2Builder, V2ConnectionContext, V2ConnectionTo};
 
+#[cfg(feature = "unstable_protocol_v2")]
+pub use role::acp::{AgentProtocolRouter, ClientProtocolConnector, ProxyProtocolRouter};
 pub use role::{
     Role, RoleId, UntypedRole,
     acp::{Agent, Client, Conductor, Proxy},
@@ -111,7 +142,14 @@ pub use role::{
 
 pub use component::{ConnectTo, DynConnectTo};
 
-// Re-export BoxFuture for implementing Component traits
+/// Implementation details used by the derive macros.
+#[doc(hidden)]
+pub mod __private {
+    pub use serde;
+    pub use serde_json;
+}
+
+// Re-export BoxFuture for implementing SDK traits that return boxed futures.
 pub use futures::future::BoxFuture;
 
 // Re-export commonly used infrastructure types for convenience
@@ -123,10 +161,14 @@ pub use agent_client_protocol_derive::{JsonRpcNotification, JsonRpcRequest, Json
 mod session;
 pub use session::*;
 
+#[cfg(not(target_family = "wasm"))]
 mod acp_agent;
-pub use acp_agent::{AcpAgent, LineDirection};
+#[cfg(not(target_family = "wasm"))]
+pub use acp_agent::{AcpAgent, AcpAgentConfig, LineDirection};
 
+#[cfg(not(target_family = "wasm"))]
 mod stdio;
+#[cfg(not(target_family = "wasm"))]
 pub use stdio::Stdio;
 
 /// This is a hack that must be given as the final argument of

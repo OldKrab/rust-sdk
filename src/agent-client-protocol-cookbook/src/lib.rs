@@ -15,13 +15,17 @@
 //! [`Client.builder()`](agent_client_protocol::Client) to build connections.
 //!
 //! - [`one_shot_prompt`] - Send a single prompt and get a response (simplest pattern)
+//! - [`v2_one_shot_prompt`] - Send a draft-v2 prompt and wait for the independent idle update
 //! - [`connecting_as_client`] - More details on connection setup and permission handling
 //!
 //! # Building Proxies
 //!
 //! A proxy sits between client and agent, intercepting and optionally modifying
-//! messages. The most common use case is adding MCP tools. Use [`Proxy.builder()`](agent_client_protocol::Proxy)
-//! to build proxy connections.
+//! messages. The most common use case is adding MCP tools. Use
+//! [`Proxy.builder()`](agent_client_protocol::Proxy) for stable protocol v1
+//! proxy connections. With the core SDK's `unstable_protocol_v2` feature, use
+//! `Proxy.v2()` for a draft-v2-only proxy, or `Proxy.protocol_router()` to
+//! expose separate strict v1 and v2 implementations as one component.
 //!
 //! **Important:** Proxies don't run standalone—they need the [`agent-client-protocol-conductor`] to
 //! orchestrate the connection between client, proxies, and agent. See
@@ -117,6 +121,152 @@ pub mod one_shot_prompt {
     //! [`RequestPermissionRequest`]: agent_client_protocol::schema::v1::RequestPermissionRequest
 }
 
+pub mod v2_one_shot_prompt {
+    //! Pattern: One prompt with the draft protocol v2 lifecycle.
+    //!
+    //! A successful v2 `session/prompt` response acknowledges acceptance; it
+    //! does not contain output and does not mean the work is complete. Install
+    //! update handlers before connecting, then consume matching updates until
+    //! the new session reports `running` and subsequently reports `idle`.
+    //!
+    //! This module is compiled with the cookbook's v2 feature coverage. For a
+    //! runnable CLI pair, see the SDK's `simple_agent_v2` and
+    //! `v2_one_shot_client` examples.
+    //!
+    //! # Example
+    //!
+    //! ```
+    //! use std::collections::HashMap;
+    //! use agent_client_protocol::{Agent, Client, ConnectTo, Error, Responder, V2ConnectionTo};
+    //! use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion, v2};
+    //! use futures::{StreamExt, channel::mpsc};
+    //!
+    //! #[derive(Default)]
+    //! struct AgentTextProjection {
+    //!     order: Vec<v2::MessageId>,
+    //!     messages: HashMap<v2::MessageId, Vec<v2::ContentBlock>>,
+    //! }
+    //!
+    //! impl AgentTextProjection {
+    //!     fn apply(&mut self, update: v2::SessionUpdate) {
+    //!         match update {
+    //!             v2::SessionUpdate::AgentMessageChunk(chunk) => {
+    //!                 self.message_content(chunk.message_id).push(chunk.content);
+    //!             }
+    //!             v2::SessionUpdate::AgentMessage(message) => {
+    //!                 let content = self.message_content(message.message_id);
+    //!                 match message.content {
+    //!                     // Snapshots patch chunks accumulated for the same message ID.
+    //!                     MaybeUndefined::Undefined => {}
+    //!                     MaybeUndefined::Null => content.clear(),
+    //!                     MaybeUndefined::Value(replacement) => *content = replacement,
+    //!                 }
+    //!             }
+    //!             _ => {}
+    //!         }
+    //!     }
+    //!
+    //!     fn message_content(
+    //!         &mut self,
+    //!         message_id: v2::MessageId,
+    //!     ) -> &mut Vec<v2::ContentBlock> {
+    //!         if !self.messages.contains_key(&message_id) {
+    //!             self.order.push(message_id.clone());
+    //!         }
+    //!         self.messages.entry(message_id).or_default()
+    //!     }
+    //!
+    //!     fn text(&self) -> String {
+    //!         self.order
+    //!             .iter()
+    //!             .filter_map(|message_id| self.messages.get(message_id))
+    //!             .flatten()
+    //!             .filter_map(|content| match content {
+    //!                 v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+    //!                 _ => None,
+    //!             })
+    //!             .collect()
+    //!     }
+    //! }
+    //!
+    //! async fn ask_agent(
+    //!     transport: impl ConnectTo<Client> + 'static,
+    //!     prompt: &str,
+    //! ) -> Result<String, Error> {
+    //!     let (update_tx, mut update_rx) = mpsc::unbounded();
+    //!
+    //!     Client.v2()
+    //!         .on_receive_notification(
+    //!             async move |update: v2::UpdateSessionNotification,
+    //!                         _connection: V2ConnectionTo<Agent>| {
+    //!                 update_tx
+    //!                     .unbounded_send(update)
+    //!                     .map_err(Error::into_internal_error)
+    //!             },
+    //!             agent_client_protocol::on_receive_notification!(),
+    //!         )
+    //!         .on_receive_request(
+    //!             async move |_request: v2::RequestPermissionRequest,
+    //!                         responder: Responder<v2::RequestPermissionResponse>,
+    //!                         _connection: V2ConnectionTo<Agent>| {
+    //!                 // This non-interactive recipe rejects permission requests.
+    //!                 responder.respond(v2::RequestPermissionResponse::new(
+    //!                     v2::RequestPermissionOutcome::Cancelled,
+    //!                 ))
+    //!             },
+    //!             agent_client_protocol::on_receive_request!(),
+    //!         )
+    //!         .connect_with(transport, async move |connection| {
+    //!             let initialized = connection
+    //!                 .send_request(v2::InitializeRequest::new(
+    //!                     ProtocolVersion::V2,
+    //!                     v2::Implementation::new("example-client", "0.1.0"),
+    //!                 ))
+    //!                 .block_task()
+    //!                 .await?;
+    //!             if initialized.capabilities.session.is_none() {
+    //!                 return Err(Error::invalid_params()
+    //!                     .data("agent did not advertise session support"));
+    //!             }
+    //!
+    //!             let session = connection
+    //!                 .build_session_cwd()?
+    //!                 .start_session()
+    //!                 .block_task()
+    //!                 .await?
+    //!                 .into_session();
+    //!
+    //!             // This response only means that the prompt was accepted.
+    //!             session.send_prompt(prompt).block_task().await?;
+    //!
+    //!             let mut projection = AgentTextProjection::default();
+    //!             let mut observed_running = false;
+    //!             while let Some(notification) = update_rx.next().await {
+    //!                 if &notification.session_id != session.session_id() {
+    //!                     continue;
+    //!                 }
+    //!                 match notification.update {
+    //!                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => {
+    //!                         observed_running = true;
+    //!                     }
+    //!                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+    //!                         if observed_running =>
+    //!                     {
+    //!                         session.close().block_task().await?;
+    //!                         return Ok(projection.text());
+    //!                     }
+    //!                     update if observed_running => projection.apply(update),
+    //!                     _ => {}
+    //!                 }
+    //!             }
+    //!             Err(Error::internal_error()
+    //!                 .data("agent disconnected before the prompt ran to completion"))
+    //!         })
+    //!         .await
+    //! }
+    //! ```
+}
+
 pub mod connecting_as_client {
     //! Pattern: Connecting as a client.
     //!
@@ -163,7 +313,8 @@ pub mod connecting_as_client {
     //! - [`read_update`] - Read the next update (text chunk, tool call, etc.)
     //! - [`read_to_string`] - Read all text until the turn ends
     //!
-    //! The session builder also supports adding MCP servers with [`with_mcp_server`].
+    //! With the core SDK's `unstable_mcp_over_acp` feature, the session builder
+    //! also supports adding MCP servers with [`with_mcp_server`].
     //!
     //! # Handling Permission Requests
     //!
@@ -174,14 +325,15 @@ pub mod connecting_as_client {
     //! Client.builder()
     //!     .on_receive_request(async |req: RequestPermissionRequest, responder, _connection| {
     //!         // Auto-approve by selecting the first option (YOLO mode)
-    //!         let option_id = req.options.first().map(|opt| opt.id.clone());
-    //!         responder.respond(RequestPermissionResponse {
-    //!             outcome: match option_id {
-    //!                 Some(id) => RequestPermissionOutcome::Selected { option_id: id },
+    //!         let option_id = req.options.first().map(|opt| opt.option_id.clone());
+    //!         responder.respond(RequestPermissionResponse::new(
+    //!             match option_id {
+    //!                 Some(id) => RequestPermissionOutcome::Selected(
+    //!                     SelectedPermissionOutcome::new(id),
+    //!                 ),
     //!                 None => RequestPermissionOutcome::Cancelled,
-    //!             },
-    //!             meta: None,
-    //!         })
+    //!             }
+    //!         ))
     //!     }, agent_client_protocol::on_receive_request!())
     //!     .connect_with(transport, async |connection| { /* ... */ })
     //!     .await
@@ -189,9 +341,10 @@ pub mod connecting_as_client {
     //!
     //! # Note on `block_task`
     //!
-    //! Using [`block_task`] is safe inside `connect_with` because the closure runs
-    //! as a spawned task, not on the event loop. The event loop continues processing
-    //! messages (including the response you're waiting for) while your task blocks.
+    //! Using [`block_task`] is safe inside `connect_with` because its foreground
+    //! future runs alongside, rather than inside, the dispatch loop. The loop
+    //! continues processing messages (including the response you're waiting for)
+    //! while the foreground future waits.
     //!
     //! [`connect_with`]: agent_client_protocol::Builder::connect_with
     //! [`block_task`]: agent_client_protocol::SentRequest::block_task
@@ -219,7 +372,7 @@ pub mod building_an_agent {
     //! # Minimal Example
     //!
     //! ```
-    //! use agent_client_protocol::{Agent, Client, ConnectTo, Dispatch, ConnectionTo};
+    //! use agent_client_protocol::{Agent, ConnectTo};
     //! use agent_client_protocol::schema::v1::{
     //!     InitializeRequest, InitializeResponse, AgentCapabilities,
     //!     NewSessionRequest, NewSessionResponse, SessionId,
@@ -248,10 +401,8 @@ pub mod building_an_agent {
     //!             // Return final response
     //!             responder.respond(PromptResponse::new(StopReason::EndTurn))
     //!         }, agent_client_protocol::on_receive_request!())
-    //!         // Reject unknown messages
-    //!         .on_receive_dispatch(async |message: Dispatch, connection: ConnectionTo<Client>| {
-    //!             message.respond_with_error(agent_client_protocol::Error::method_not_found(), connection)
-    //!         }, agent_client_protocol::on_receive_dispatch!())
+    //!         // Unknown requests receive Method not found automatically;
+    //!         // unhandled notifications are ignored.
     //!         .connect_to(transport)
     //!         .await
     //! }
@@ -265,28 +416,17 @@ pub mod building_an_agent {
     //! ```ignore
     //! .on_receive_request(async |req: PromptRequest, responder, connection| {
     //!     // Stream some text
-    //!     connection.send_notification(SessionNotification {
-    //!         session_id: req.session_id.clone(),
-    //!         update: SessionUpdate::Text(TextUpdate {
-    //!             text: "Hello, ".into(),
-    //!             // ...
-    //!         }),
-    //!         meta: None,
-    //!     })?;
+    //!     connection.send_notification(SessionNotification::new(
+    //!         req.session_id.clone(),
+    //!         SessionUpdate::AgentMessageChunk(ContentChunk::new("Hello, ".into())),
+    //!     ))?;
     //!
-    //!     connection.send_notification(SessionNotification {
-    //!         session_id: req.session_id.clone(),
-    //!         update: SessionUpdate::Text(TextUpdate {
-    //!             text: "world!".into(),
-    //!             // ...
-    //!         }),
-    //!         meta: None,
-    //!     })?;
+    //!     connection.send_notification(SessionNotification::new(
+    //!         req.session_id.clone(),
+    //!         SessionUpdate::AgentMessageChunk(ContentChunk::new("world!".into())),
+    //!     ))?;
     //!
-    //!     responder.respond(PromptResponse {
-    //!         stop_reason: StopReason::EndTurn,
-    //!         meta: None,
-    //!     })
+    //!     responder.respond(PromptResponse::new(StopReason::EndTurn))
     //! }, agent_client_protocol::on_receive_request!())
     //! ```
     //!
@@ -296,18 +436,23 @@ pub mod building_an_agent {
     //! or writing files), send a [`RequestPermissionRequest`]:
     //!
     //! ```ignore
-    //! let response = connection.send_request(RequestPermissionRequest {
-    //!     session_id: session_id.clone(),
-    //!     action: PermissionAction::Bash { command: "rm -rf /".into() },
-    //!     options: vec![
-    //!         PermissionOption { id: "allow".into(), label: "Allow".into() },
-    //!         PermissionOption { id: "deny".into(), label: "Deny".into() },
+    //! let response = connection.send_request(RequestPermissionRequest::new(
+    //!     session_id.clone(),
+    //!     ToolCallUpdate::new(
+    //!         "dangerous-command",
+    //!         ToolCallUpdateFields::new()
+    //!             .title("Run rm -rf /")
+    //!             .kind(ToolKind::Execute)
+    //!             .status(ToolCallStatus::Pending),
+    //!     ),
+    //!     vec![
+    //!         PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+    //!         PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
     //!     ],
-    //!     meta: None,
-    //! }).block_task().await?;
+    //! )).block_task().await?;
     //!
     //! match response.outcome {
-    //!     RequestPermissionOutcome::Selected { option_id } if option_id == "allow" => {
+    //!     RequestPermissionOutcome::Selected(selected) if selected.option_id == "allow" => {
     //!         // User approved, proceed with action
     //!     }
     //!     _ => {
@@ -371,10 +516,11 @@ pub mod reusable_components {
     //! # Important: Don't block the event loop
     //!
     //! Message handlers run on the event loop. Blocking in a handler prevents the
-    //! connection from processing new messages. For expensive work:
+    //! connection from processing new messages:
     //!
     //! - Use [`ConnectionTo::spawn`] to offload work to a background task
-    //! - Use [`on_receiving_result`] to schedule work when a response arrives
+    //! - Use [`on_receiving_result`] for bounded, ordered response handling; if it
+    //!   must await later traffic, spawn that work from the callback and return
     //!
     //! [`ConnectTo`]: agent_client_protocol::ConnectTo
     //! [`ConnectionTo::spawn`]: agent_client_protocol::ConnectionTo::spawn
@@ -441,7 +587,10 @@ pub mod global_mcp_server {
     //!
     //! Use this pattern when you want a single MCP server that handles tool calls
     //! for all sessions. The server is added to the connection's handler chain and
-    //! automatically injects itself into every `NewSessionRequest` that passes through.
+    //! automatically injects itself into every supported session setup request.
+    //! This pattern requires the core SDK's `unstable_mcp_over_acp` feature (or
+    //! the rmcp crate's matching passthrough feature). Draft v2 additionally
+    //! requires `unstable_protocol_v2`.
     //!
     //! # When to use
     //!
@@ -475,7 +624,7 @@ pub mod global_mcp_server {
     //!         agent_client_protocol::tool_fn!())
     //!     .build();
     //!
-    //! // The proxy component is generic over the MCP server's responder type
+    //! // The proxy component is generic over the MCP server's runner type
     //! struct MyProxy<R> {
     //!     mcp_server: McpServer<Conductor, R>,
     //! }
@@ -490,6 +639,16 @@ pub mod global_mcp_server {
     //! }
     //!
     //! let proxy = MyProxy { mcp_server };
+    //! ```
+    //!
+    //! The example uses stable protocol v1. A draft v2 proxy selects its API
+    //! before attaching the server:
+    //!
+    //! ```rust,ignore
+    //! Proxy.v2()
+    //!     .with_mcp_server(mcp_server)
+    //!     .connect_to(conductor)
+    //!     .await?;
     //! ```
     //!
     //! # Using rmcp
@@ -527,7 +686,7 @@ pub mod global_mcp_server {
     //! impl MyMcpServer {
     //!     #[tool(description = "Echoes back the input message")]
     //!     async fn echo(&self, Parameters(params): Parameters<EchoParams>) -> Result<CallToolResult, rmcp::ErrorData> {
-    //!         Ok(CallToolResult::success(vec![Content::text(format!("Echo: {}", params.message))]))
+    //!         Ok(CallToolResult::success(vec![ContentBlock::text(format!("Echo: {}", params.message))]))
     //!     }
     //! }
     //!
@@ -552,10 +711,14 @@ pub mod global_mcp_server {
     //! When you call [`with_mcp_server`], the MCP server is added as a message
     //! handler. It:
     //!
-    //! 1. Intercepts `NewSessionRequest` messages and adds its `acp:UUID` URL to the
-    //!    request's `mcp_servers` list
+    //! 1. Intercepts session setup requests and adds a schema-native
+    //!    `McpServer::Acp` declaration with one connection-scoped server ID.
+    //!    V1 injects it into `session/new`, `session/load`, `session/resume`,
+    //!    and feature-gated `session/fork`; v2 injects it into
+    //!    `session/new`, `session/resume`, and feature-gated `session/fork`
+    //!    while preserving unrelated request fields
     //! 2. Passes the modified request through to the next handler
-    //! 3. Handles incoming MCP protocol messages (tool calls, etc.) for its URL
+    //! 3. Handles `mcp/connect`, `mcp/message`, and `mcp/disconnect` for that server ID
     //!
     //! [`McpServer::builder`]: agent_client_protocol_rmcp::McpServerExt::builder
     //! [`McpServer::from_rmcp`]: agent_client_protocol_rmcp::McpServerExt::from_rmcp
@@ -567,14 +730,17 @@ pub mod per_session_mcp_server {
     //!
     //! Use this pattern when each session needs its own MCP server instance
     //! with access to session-specific context like the working directory.
+    //! It requires the core SDK's `unstable_mcp_over_acp` feature (or the rmcp
+    //! crate's matching passthrough feature). Draft v2 additionally requires
+    //! `unstable_protocol_v2`.
     //!
     //! # When to use
     //!
     //! - Tools need access to the session's working directory
-    //! - You want to track active sessions or maintain per-session state
+    //! - You want eventual active-session tracking that does not need to precede later traffic
     //! - Tools need to customize behavior based on session parameters
     //!
-    //! # Basic pattern with `on_proxy_session_start`
+    //! # Stable v1 pattern with `on_proxy_session_start`
     //!
     //! The most common pattern intercepts [`NewSessionRequest`], extracts context,
     //! creates a per-session MCP server, and uses [`on_proxy_session_start`] to
@@ -605,13 +771,12 @@ pub mod per_session_mcp_server {
     //!             connection.build_session_from(request)
     //!                 .with_mcp_server(mcp_server)?
     //!                 .on_proxy_session_start(responder, async move |session_id| {
-    //!                     // This callback runs after the session-id has been sent to the
-    //!                     // client but before any further messages from the client or agent
-    //!                     // related to this session have been processed.
+    //!                     // Session proxying is installed before this callback is spawned.
     //!                     //
-    //!                     // You can use this to store the `session_id` before processing
-    //!                     // future messages, or to send a first prompt to the agent before
-    //!                     // the client has a chance to do so.
+    //!                     // Use this for follow-up work that may wait for later connection
+    //!                     // traffic. Register ID-independent state in the request handler.
+    //!                     // For ID-keyed state, preinstall a gate that later handlers await,
+    //!                     // then populate it here.
     //!                     tracing::info!(%session_id, "Session started");
     //!                     Ok(())
     //!                 })
@@ -631,13 +796,88 @@ pub mod per_session_mcp_server {
     //! 4. Runs your callback with the `SessionId`
     //!
     //! The callback runs after the session is established but doesn't block
-    //! the message handler. This is ideal for proxies that just need to inject
-    //! tools and track sessions.
+    //! the message handler. It is suitable for follow-up work and eventual
+    //! session tracking. Because it runs concurrently with later traffic, it
+    //! does not guarantee that bookkeeping keyed by `SessionId` completes
+    //! first. Register ID-independent state before calling the helper. For
+    //! ID-keyed state, preinstall a gate or placeholder that later handlers
+    //! await, then populate it from the callback.
     //!
-    //! # Alternative: blocking with `start_session_proxy`
+    //! # Draft v2 pattern
     //!
-    //! If you need the simpler blocking API (e.g., in a client context where
-    //! blocking is safe), use [`block_task`] + [`start_session_proxy`]:
+    //! `Proxy.v2()` exposes the same non-blocking setup shape with v2 schema
+    //! types. `V2SessionBuilder` handles `session/new`, while
+    //! `V2ResumeSessionBuilder` handles `session/resume`. With
+    //! `unstable_session_fork`, `V2ForkSessionBuilder` handles `session/fork`.
+    //! Their `on_proxy_session_start` callbacks receive an `OpenedV2Session`,
+    //! not just a session ID, so they retain both the command-only handle and
+    //! the complete operation-specific response:
+    //!
+    //! ```rust,ignore
+    //! use agent_client_protocol::schema::v2;
+    //!
+    //! Proxy.v2()
+    //!     .on_receive_request_from(
+    //!         Client,
+    //!         async |request: v2::NewSessionRequest, responder, connection| {
+    //!             let workspace_path = request.cwd.clone();
+    //!             let mcp_server = build_workspace_server(workspace_path);
+    //!
+    //!             connection
+    //!                 .build_session_from(request)
+    //!                 .with_mcp_server(mcp_server)?
+    //!                 .on_proxy_session_start(responder, async move |opened| {
+    //!                     let (session, setup_response) = opened.into_parts();
+    //!                     tracing::info!(
+    //!                         session_id = %session.session_id(),
+    //!                         ?setup_response,
+    //!                         "Session started"
+    //!                     );
+    //!                     Ok(())
+    //!                 })
+    //!         },
+    //!         agent_client_protocol::on_receive_request!(),
+    //!     );
+    //! ```
+    //!
+    //! Resume uses the same terminal helper after constructing the per-session
+    //! server from the resume request:
+    //!
+    //! ```rust,ignore
+    //! Proxy.v2()
+    //!     .on_receive_request_from(
+    //!         Client,
+    //!         async |request: v2::ResumeSessionRequest, responder, connection| {
+    //!             let mcp_server = build_workspace_server(request.cwd.clone());
+    //!             connection
+    //!                 .resume_session_from(request)
+    //!                 .with_mcp_server(mcp_server)?
+    //!                 .on_proxy_session_start(responder, async move |opened| {
+    //!                     tracing::info!(session_id = %opened.session().session_id(), "Session resumed");
+    //!                     Ok(())
+    //!                 })
+    //!         },
+    //!         agent_client_protocol::on_receive_request!(),
+    //!     );
+    //! ```
+    //!
+    //! Fork uses the same terminal helper after
+    //! `connection.fork_session_from(request)`. Its returned handle and route
+    //! use the newly allocated ID from the complete `ForkSessionResponse`, not
+    //! the source session ID.
+    //!
+    //! All helpers forward upstream cancellation and the complete setup
+    //! response. New-session and fork routing are installed before later
+    //! inbound traffic; resume routing and MCP readiness are established
+    //! before the request is published so replay can precede its response. The
+    //! callback runs outside the ordering barrier. V2 updates and interactive
+    //! requests remain independent connection traffic.
+    //!
+    //! # Stable v1 alternative: spawning `start_session_proxy`
+    //!
+    //! If you need the linear [`start_session_proxy`] API, move it into a
+    //! spawned task. Awaiting it directly in the request handler would block
+    //! the dispatch loop that must receive the agent's response:
     //!
     //! ```
     //! # use agent_client_protocol::mcp_server::McpServer;
@@ -654,13 +894,17 @@ pub mod per_session_mcp_server {
     //!                 }, agent_client_protocol::tool_fn!())
     //!                 .build();
     //!
-    //!             let session_id = connection.build_session_from(request)
-    //!                 .with_mcp_server(mcp_server)?
-    //!                 .block_task()
-    //!                 .start_session_proxy(responder)
-    //!                 .await?;
+    //!             let task_connection = connection.clone();
+    //!             connection.spawn(async move {
+    //!                 let session_id = task_connection.build_session_from(request)
+    //!                     .with_mcp_server(mcp_server)?
+    //!                     .block_task()
+    //!                     .start_session_proxy(responder)
+    //!                     .await?;
     //!
-    //!             tracing::info!(%session_id, "Session started");
+    //!                 tracing::info!(%session_id, "Session started");
+    //!                 Ok(())
+    //!             })?;
     //!             Ok(())
     //!         }, agent_client_protocol::on_receive_request!())
     //!         .connect_to(transport)
@@ -801,21 +1045,12 @@ pub mod running_proxies_with_conductor {
     //! # Using the `agent-client-protocol-conductor` binary
     //!
     //! The simplest way to run a proxy is with the [`agent-client-protocol-conductor`] binary.
-    //! Configure it with a JSON file:
-    //!
-    //! ```json
-    //! {
-    //!   "proxies": [
-    //!     { "command": ["cargo", "run", "--bin", "my-proxy"] }
-    //!   ],
-    //!   "agent": { "command": ["claude-code", "--agent"] }
-    //! }
-    //! ```
-    //!
-    //! Then run:
+    //! Pass the proxy commands followed by the final agent command:
     //!
     //! ```bash
-    //! agent-client-protocol-conductor --config conductor.json
+    //! agent-client-protocol-conductor agent \
+    //!   "cargo run --bin my-proxy" \
+    //!   "claude-code --agent"
     //! ```
     //!
     //! # Using the conductor as a library
@@ -823,19 +1058,20 @@ pub mod running_proxies_with_conductor {
     //! For more control, use [`agent-client-protocol-conductor`] as a library with the `ConductorImpl` type:
     //!
     //! ```ignore
+    //! use agent_client_protocol::{AcpAgent, ConnectTo};
     //! use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
     //!
     //! // Define your proxy as a ConnectTo<Conductor>
     //! let my_proxy = MyProxy::new();
     //!
-    //! // Spawn the agent process
-    //! let agent_process = agent_client_protocol::spawn_process("claude-code", &["--agent"]).await?;
+    //! // Configure the agent process
+    //! let agent = AcpAgent::from_args(["claude-code", "--agent"])?;
     //!
     //! // Create the conductor with your proxy chain
-    //! let conductor = ConductorImpl::new(ProxiesAndAgent {
-    //!     proxies: vec![Box::new(my_proxy)],
-    //!     agent: agent_process,
-    //! });
+    //! let conductor = ConductorImpl::new_agent(
+    //!     "my-conductor",
+    //!     ProxiesAndAgent::new(agent).proxy(my_proxy),
+    //! );
     //!
     //! // Run the conductor (it will accept client connections on stdin/stdout)
     //! conductor.connect_to(client_transport).await?;
@@ -857,5 +1093,5 @@ pub mod running_proxies_with_conductor {
     //!
     //! [`agent-client-protocol-conductor`]: https://crates.io/crates/agent-client-protocol-conductor
     //! [`SuccessorMessage`]: agent_client_protocol::schema::SuccessorMessage
-    //! [`agent-client-protocol-conductor` tests]: https://github.com/anthropics/acp-rust-sdk/tree/main/src/agent-client-protocol-conductor/tests
+    //! [`agent-client-protocol-conductor` tests]: https://github.com/agentclientprotocol/rust-sdk/tree/main/src/agent-client-protocol-conductor/tests
 }

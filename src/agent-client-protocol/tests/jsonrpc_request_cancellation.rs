@@ -1,5 +1,3 @@
-#![cfg(feature = "unstable_cancel_request")]
-
 //! Integration tests for `$/cancel_request` support.
 //!
 //! These tests avoid sleeps by relying on two ordering guarantees:
@@ -12,7 +10,10 @@
 //! - Test handlers report observed cancellations through in-process channels,
 //!   which the test awaits (with a timeout) instead of sleeping.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    future::{Future, ready},
+    sync::{Arc, Mutex},
+};
 
 use agent_client_protocol::{
     Channel, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, JsonRpcMessage, JsonRpcRequest,
@@ -153,15 +154,15 @@ impl Role for WrappedHost {
         RoleId::from_singleton(self)
     }
 
-    async fn default_handle_dispatch_from(
+    fn default_handle_dispatch_from(
         &self,
         message: Dispatch,
         _connection: ConnectionTo<Self>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, agent_client_protocol::Error>> + Send {
+        ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn counterpart(&self) -> Self::Counterpart {
@@ -176,15 +177,15 @@ impl Role for WrappedCounterpart {
         RoleId::from_singleton(self)
     }
 
-    async fn default_handle_dispatch_from(
+    fn default_handle_dispatch_from(
         &self,
         message: Dispatch,
         _connection: ConnectionTo<Self>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, agent_client_protocol::Error>> + Send {
+        ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn counterpart(&self) -> Self::Counterpart {
@@ -199,15 +200,15 @@ impl Role for WrappedSuccessor {
         RoleId::from_singleton(self)
     }
 
-    async fn default_handle_dispatch_from(
+    fn default_handle_dispatch_from(
         &self,
         message: Dispatch,
         _connection: ConnectionTo<Self>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, agent_client_protocol::Error>> + Send {
+        ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn counterpart(&self) -> Self::Counterpart {
@@ -222,15 +223,15 @@ impl Role for WrappedSuccessorCounterpart {
         RoleId::from_singleton(self)
     }
 
-    async fn default_handle_dispatch_from(
+    fn default_handle_dispatch_from(
         &self,
         message: Dispatch,
         _connection: ConnectionTo<Self>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, agent_client_protocol::Error>> + Send {
+        ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn counterpart(&self) -> Self::Counterpart {
@@ -496,7 +497,7 @@ async fn cancelling_request_sent_to_successor_peer_sends_wrapped_cancel() {
                             message: "wrapped cancel".into(),
                         },
                     );
-                    let expected_id = request.id();
+                    let expected_id = request.id().clone();
                     request.cancel()?;
                     let error = request
                         .block_task()
@@ -512,7 +513,7 @@ async fn cancelling_request_sent_to_successor_peer_sends_wrapped_cancel() {
             // The cancellation arrived wrapped, for the wrapped request's
             // outer JSON-RPC id, and never in unwrapped form.
             let received = next_with_timeout(&mut wrapped_cancel_rx).await;
-            assert_eq!(serde_json::to_value(received).unwrap(), expected_id);
+            assert_eq!(received, expected_id);
             assert_no_event(&mut wrapped_cancel_rx);
             assert_no_event(&mut plain_cancel_rx);
         })
@@ -617,7 +618,7 @@ async fn sent_request_can_send_cancellation_for_its_id() {
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "slow".into(),
                     });
-                    let expected_id = request.id();
+                    let expected_id = request.id().clone();
                     request.cancel()?;
                     let received = next_with_timeout(&mut cancel_rx).await;
 
@@ -640,7 +641,7 @@ async fn sent_request_can_send_cancellation_for_its_id() {
                 .await
                 .unwrap();
 
-            assert_eq!(serde_json::to_value(received).unwrap(), expected_id);
+            assert_eq!(received, expected_id);
             assert_no_event(&mut cancel_rx);
         })
         .await;
@@ -690,7 +691,7 @@ async fn dropped_sent_request_sends_cancellation_for_its_id() {
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "abandoned".into(),
                     });
-                    let expected_id = request.id();
+                    let expected_id = request.id().clone();
                     drop(request);
                     let received = next_with_timeout(&mut cancel_rx).await;
                     Ok((expected_id, received))
@@ -698,7 +699,7 @@ async fn dropped_sent_request_sends_cancellation_for_its_id() {
                 .await
                 .unwrap();
 
-            assert_eq!(serde_json::to_value(received).unwrap(), expected_id);
+            assert_eq!(received, expected_id);
             assert_no_event(&mut cancel_rx);
         })
         .await;
@@ -849,7 +850,7 @@ async fn late_response_after_dropped_sent_request_does_not_close_connection() {
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "late".into(),
                     });
-                    let expected_id = request.id();
+                    let expected_id = request.id().clone();
                     drop(request);
 
                     let received = next_with_timeout(&mut cancel_rx).await;
@@ -870,7 +871,7 @@ async fn late_response_after_dropped_sent_request_does_not_close_connection() {
                 .unwrap();
 
             assert_eq!(response.result, "echo: after late");
-            assert_eq!(serde_json::to_value(received).unwrap(), expected_id);
+            assert_eq!(received, expected_id);
         })
         .await;
 }
@@ -1001,7 +1002,7 @@ async fn response_claimed_by_dispatch_handler_disarms_auto_cancellation() {
 
             // The JSON-RPC id whose response the dispatch handler below
             // claims (and discards) without ever invoking the router.
-            let claimed_id: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let claimed_id: Arc<Mutex<Option<RequestId>>> = Arc::new(Mutex::new(None));
 
             let client_transport =
                 agent_client_protocol::ByteStreams::new(client_writer, client_reader);
@@ -1012,7 +1013,7 @@ async fn response_claimed_by_dispatch_handler_disarms_auto_cancellation() {
                         let claimed_id = claimed_id.clone();
                         async move |dispatch: Dispatch, _connection: ConnectionTo<UntypedRole>| {
                             if let Dispatch::Response(_, router) = &dispatch
-                                && claimed_id.lock().unwrap().as_ref() == Some(&router.id())
+                                && claimed_id.lock().unwrap().as_ref() == Some(router.id())
                             {
                                 // Claim the response; the router is dropped
                                 // without responding.
@@ -1030,7 +1031,7 @@ async fn response_claimed_by_dispatch_handler_disarms_auto_cancellation() {
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "claimed".into(),
                     });
-                    *claimed_id.lock().unwrap() = Some(request.id());
+                    *claimed_id.lock().unwrap() = Some(request.id().clone());
 
                     // The server answers requests in order, so once this
                     // round trip completes, the response to `claimed` has
@@ -1107,7 +1108,7 @@ async fn response_retained_by_dispatch_handler_disarms_auto_cancellation() {
                 }
             });
 
-            let claimed_id: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let claimed_id: Arc<Mutex<Option<RequestId>>> = Arc::new(Mutex::new(None));
             let retained_response: Arc<Mutex<Option<Dispatch>>> = Arc::new(Mutex::new(None));
 
             let client_transport =
@@ -1121,7 +1122,7 @@ async fn response_retained_by_dispatch_handler_disarms_auto_cancellation() {
                         async move |dispatch: Dispatch, _connection: ConnectionTo<UntypedRole>| {
                             let should_claim = match &dispatch {
                                 Dispatch::Response(_, router) => {
-                                    claimed_id.lock().unwrap().as_ref() == Some(&router.id())
+                                    claimed_id.lock().unwrap().as_ref() == Some(router.id())
                                 }
                                 Dispatch::Request(_, _) | Dispatch::Notification(_) => false,
                             };
@@ -1143,7 +1144,7 @@ async fn response_retained_by_dispatch_handler_disarms_auto_cancellation() {
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "retained".into(),
                     });
-                    *claimed_id.lock().unwrap() = Some(request.id());
+                    *claimed_id.lock().unwrap() = Some(request.id().clone());
 
                     // This proves the earlier response was routed into the
                     // handler and is still retained rather than dropped.
@@ -1442,7 +1443,7 @@ async fn send_proxied_message_does_not_tunnel_cancel_notifications() {
                                     responder: Responder<SimpleResponse>,
                                     _connection: ConnectionTo<UntypedRole>| {
                             if request.message == "park" {
-                                parked_id_tx.unbounded_send(responder.id()).unwrap();
+                                parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                                 *pending_responder.lock().unwrap() = Some(responder);
                                 return Ok(());
                             }
@@ -1519,7 +1520,7 @@ async fn send_proxied_message_does_not_tunnel_cancel_notifications() {
                         connection.send_request(SimpleRequest {
                             message: "park".into(),
                         });
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -1552,7 +1553,7 @@ async fn send_proxied_message_does_not_tunnel_cancel_notifications() {
                 "the proxy must re-issue the request under its own ID"
             );
             let observed = next_with_timeout(&mut backend_cancel_rx).await;
-            assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+            assert_eq!(observed, parked_id);
             assert_no_event(&mut backend_cancel_rx);
         })
         .await;
@@ -1684,7 +1685,7 @@ async fn send_proxied_message_does_not_tunnel_wrapped_cancel_notifications() {
 /// Returns the proxy-side connection to the backend.
 async fn spawn_parking_backend(
     honor_cancellations: bool,
-    parked_id_tx: mpsc::UnboundedSender<serde_json::Value>,
+    parked_id_tx: mpsc::UnboundedSender<RequestId>,
     backend_cancel_tx: mpsc::UnboundedSender<RequestId>,
 ) -> ConnectionTo<UntypedRole> {
     let pending_responder: Arc<Mutex<Option<Responder<SimpleResponse>>>> =
@@ -1716,7 +1717,7 @@ async fn spawn_parking_backend(
                             _connection: ConnectionTo<UntypedRole>| {
                     match request.message.as_str() {
                         "park" => {
-                            parked_id_tx.unbounded_send(responder.id()).unwrap();
+                            parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                             *pending_responder.lock().unwrap() = Some(responder);
                             Ok(())
                         }
@@ -1822,7 +1823,7 @@ async fn custom_forwarding_propagates_cancellation_when_opted_in() {
                         connection.send_request(SimpleRequest {
                             message: "park".into(),
                         });
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -1848,7 +1849,7 @@ async fn custom_forwarding_propagates_cancellation_when_opted_in() {
             let parked_id = next_with_timeout(&mut parked_id_rx).await;
             assert_ne!(parked_id, client_request_id);
             let observed = next_with_timeout(&mut backend_cancel_rx).await;
-            assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+            assert_eq!(observed, parked_id);
             assert_no_event(&mut backend_cancel_rx);
         })
         .await;
@@ -2042,26 +2043,29 @@ struct CancelCollector {
 }
 
 impl HandleDispatchFrom<UntypedRole> for CancelCollector {
-    async fn handle_dispatch_from(
+    fn handle_dispatch_from(
         &mut self,
         message: Dispatch,
         _connection: ConnectionTo<UntypedRole>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, agent_client_protocol::Error>> + Send {
         if let Dispatch::Notification(notification) = &message
             && CancelRequestNotification::matches_method(&notification.method)
         {
-            let cancel = CancelRequestNotification::parse_message(
+            let cancel = match CancelRequestNotification::parse_message(
                 &notification.method,
                 &notification.params,
-            )?;
+            ) {
+                Ok(cancel) => cancel,
+                Err(error) => return ready(Err(error)),
+            };
             self.tx.unbounded_send(cancel.request_id).unwrap();
-            return Ok(Handled::Yes);
+            return ready(Ok(Handled::Yes));
         }
 
-        Ok(Handled::No {
+        ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn describe_chain(&self) -> impl std::fmt::Debug {
@@ -2107,7 +2111,7 @@ async fn retried_protocol_level_notification_reaches_later_dynamic_handler() {
                                     .add_dynamic_handler(CancelCollector {
                                         tx: collector_tx.clone(),
                                     })?
-                                    .run_indefinitely();
+                                    .detach();
                             }
                             responder.respond(SimpleResponse {
                                 result: format!("echo: {}", request.message),

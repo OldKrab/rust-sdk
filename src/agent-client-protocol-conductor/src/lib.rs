@@ -32,7 +32,7 @@
 //!
 //! **Component Communication:**
 //! - Editor talks to conductor via stdio
-//! - Conductor uses `_proxy/successor/*` protocol extensions to route messages
+//! - Conductor uses the `_proxy/successor` envelope to route messages
 //! - Each proxy can intercept, transform, or forward messages
 //! - Final agent receives standard ACP messages
 //!
@@ -59,9 +59,9 @@
 //!
 //! ## Related Crates
 //!
-//! - **[agent-client-protocol-proxy](https://crates.io/crates/agent-client-protocol-proxy)** - Framework for building proxy components
 //! - **[agent-client-protocol](https://crates.io/crates/agent-client-protocol)** - Core ACP SDK
-//! - **[agent-client-protocol](https://crates.io/crates/agent-client-protocol)** - Core protocol types, traits, and process spawning
+//! - **[agent-client-protocol-polyfill](https://crates.io/crates/agent-client-protocol-polyfill)** - Compatibility proxies, including the native MCP-over-ACP to HTTP adapter
+//! - **[agent-client-protocol-trace-viewer](https://crates.io/crates/agent-client-protocol-trace-viewer)** - Interactive trace visualization
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -78,6 +78,8 @@ pub use self::conductor::*;
 
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "unstable_protocol_v2")]
+use agent_client_protocol::schema::v2;
 use agent_client_protocol::{AcpAgent, Stdio};
 use agent_client_protocol::{Client, Conductor, DynConnectTo, schema::v1::InitializeRequest};
 use tracing::Instrument;
@@ -86,9 +88,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// Wrapper for command-line component lists that can serve as either
 /// proxies-only (for proxy mode) or proxies+agent (for agent mode).
 ///
-/// This exists because `AcpAgent` implements `Component<L>` for all `L`,
-/// so a `Vec<AcpAgent>` can be used as either a list of proxies or as
-/// proxies + final agent depending on the conductor mode.
+/// This exists because `AcpAgent` implements `ConnectTo<Client>` and
+/// `ConnectTo<Conductor>`, so a `Vec<AcpAgent>` can be used as either a list
+/// of proxies or as proxies + final agent depending on the conductor mode.
 #[derive(Debug)]
 pub struct CommandLineComponents(pub Vec<AcpAgent>);
 
@@ -99,6 +101,20 @@ impl InstantiateProxies for CommandLineComponents {
     ) -> futures::future::BoxFuture<
         'static,
         Result<(InitializeRequest, Vec<DynConnectTo<Conductor>>), agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            let proxies = self.0.into_iter().map(DynConnectTo::new).collect();
+            Ok((req, proxies))
+        })
+    }
+
+    #[cfg(feature = "unstable_protocol_v2")]
+    fn instantiate_v2_proxies(
+        self: Box<Self>,
+        req: v2::InitializeRequest,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<(v2::InitializeRequest, Vec<DynConnectTo<Conductor>>), agent_client_protocol::Error>,
     > {
         Box::pin(async move {
             let proxies = self.0.into_iter().map(DynConnectTo::new).collect();
@@ -134,6 +150,39 @@ impl InstantiateProxiesAndAgent for CommandLineComponents {
                     // Last element is the agent
                     let agent = DynConnectTo::new(component);
                     return Ok((req, proxies, agent));
+                }
+            }
+
+            Err(agent_client_protocol::util::internal_error(
+                "no agent component in list",
+            ))
+        })
+    }
+
+    #[cfg(feature = "unstable_protocol_v2")]
+    fn instantiate_v2_proxies_and_agent(
+        self: Box<Self>,
+        req: v2::InitializeRequest,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<
+            (
+                v2::InitializeRequest,
+                Vec<DynConnectTo<Conductor>>,
+                DynConnectTo<Client>,
+            ),
+            agent_client_protocol::Error,
+        >,
+    > {
+        Box::pin(async move {
+            let mut iter = self.0.into_iter().peekable();
+            let mut proxies = Vec::new();
+
+            while let Some(component) = iter.next() {
+                if iter.peek().is_some() {
+                    proxies.push(DynConnectTo::new(component));
+                } else {
+                    return Ok((req, proxies, DynConnectTo::new(component)));
                 }
             }
 

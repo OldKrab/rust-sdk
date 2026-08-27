@@ -1,5 +1,3 @@
-#![cfg(feature = "unstable_cancel_request")]
-
 //! Integration tests for `$/cancel_request` propagation through the conductor.
 //!
 //! Cancellation is hop-by-hop: every hop re-issues `$/cancel_request` with
@@ -21,14 +19,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::DynConnectTo;
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelRequestNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    McpServer as SchemaMcpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCallUpdate, ToolCallUpdateFields,
+    CancelRequestNotification, ConnectMcpRequest, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, McpServer as SchemaMcpServer, McpServerAcpId, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::schema::{McpConnectRequest, ProtocolVersion};
 use agent_client_protocol::{
     Agent, ByteStreams, Client, Conductor, ConnectTo, ConnectionTo, Error, JsonRpcRequest,
     JsonRpcResponse, NullRun, Proxy, Responder, Role, SentRequest,
@@ -55,7 +54,7 @@ struct SimpleResponse {
 
 #[derive(Clone)]
 struct TrackingMcpServer {
-    connect_tx: mpsc::UnboundedSender<String>,
+    connect_tx: mpsc::UnboundedSender<McpServerAcpId>,
 }
 
 impl<Counterpart: Role> McpServerConnect<Counterpart> for TrackingMcpServer {
@@ -64,7 +63,13 @@ impl<Counterpart: Role> McpServerConnect<Counterpart> for TrackingMcpServer {
     }
 
     fn connect(&self, cx: McpConnectionTo<Counterpart>) -> DynConnectTo<role::mcp::Client> {
-        self.connect_tx.unbounded_send(cx.acp_id()).unwrap();
+        self.connect_tx
+            .unbounded_send(
+                cx.server_id()
+                    .expect("cancellation test server is attached through ACP")
+                    .clone(),
+            )
+            .unwrap();
         DynConnectTo::new(EmptyMcpServerComponent)
     }
 }
@@ -102,10 +107,10 @@ fn assert_no_event<T: std::fmt::Debug>(rx: &mut mpsc::UnboundedReceiver<T>) {
     }
 }
 
-fn advertised_mcp_acp_id(request: &NewSessionRequest) -> String {
+fn advertised_mcp_server_id(request: &NewSessionRequest) -> McpServerAcpId {
     match request.mcp_servers.as_slice() {
-        [SchemaMcpServer::Http(http)] => http.url.clone(),
-        servers => panic!("expected exactly one HTTP MCP server, got {servers:?}"),
+        [SchemaMcpServer::Acp(acp)] => acp.server_id.clone(),
+        servers => panic!("expected exactly one ACP MCP server, got {servers:?}"),
     }
 }
 
@@ -154,7 +159,7 @@ async fn client_cancellation_propagates_hop_by_hop_to_agent() -> Result<(), Erro
                         responder: Responder<SimpleResponse>,
                         cx: ConnectionTo<Client>| {
                 if request.message == "park" {
-                    parked_id_tx.unbounded_send(responder.id()).unwrap();
+                    parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -214,7 +219,7 @@ async fn client_cancellation_propagates_hop_by_hop_to_agent() -> Result<(), Erro
                     let request: SentRequest<SimpleResponse> = cx.send_request(SimpleRequest {
                         message: "park".into(),
                     });
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     // The cancellation reaches the agent hop by hop, and the
@@ -254,7 +259,7 @@ async fn client_cancellation_propagates_hop_by_hop_to_agent() -> Result<(), Erro
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut agent_cancel_rx);
 
     conductor_handle.abort();
@@ -336,7 +341,7 @@ async fn agent_cancellation_propagates_hop_by_hop_to_client() -> Result<(), Erro
                             responder: Responder<SimpleResponse>,
                             cx: ConnectionTo<Agent>| {
                     assert_eq!(request.message, "park");
-                    parked_id_tx.unbounded_send(responder.id()).unwrap();
+                    parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -401,7 +406,7 @@ async fn agent_cancellation_propagates_hop_by_hop_to_client() -> Result<(), Erro
     // its own connection.
     let parked_id = next_with_timeout(&mut parked_id_rx).await;
     let observed = next_with_timeout(&mut client_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut client_cancel_rx);
 
     conductor_handle.abort();
@@ -463,7 +468,7 @@ async fn prompt_cancellation_cascades_through_real_proxy_chain() -> Result<(), E
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                prompt_id_tx.unbounded_send(responder.id()).unwrap();
+                prompt_id_tx.unbounded_send(responder.id().clone()).unwrap();
                 let cancellation = responder.cancellation();
                 let connection = cx.clone();
                 cx.spawn(async move {
@@ -536,7 +541,9 @@ async fn prompt_cancellation_cascades_through_real_proxy_chain() -> Result<(), E
                 async move |_request: RequestPermissionRequest,
                             responder: Responder<RequestPermissionResponse>,
                             cx: ConnectionTo<Agent>| {
-                    permission_id_tx.unbounded_send(responder.id()).unwrap();
+                    permission_id_tx
+                        .unbounded_send(responder.id().clone())
+                        .unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -590,7 +597,7 @@ async fn prompt_cancellation_cascades_through_real_proxy_chain() -> Result<(), E
                         session.session_id.clone(),
                         vec!["park".into()],
                     ));
-                    let client_prompt_id = prompt.id();
+                    let client_prompt_id = prompt.id().clone();
                     prompt.cancel()?;
 
                     let error = prompt
@@ -629,14 +636,14 @@ async fn prompt_cancellation_cascades_through_real_proxy_chain() -> Result<(), E
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), prompt_id);
+    assert_eq!(observed, prompt_id);
     assert_no_event(&mut agent_cancel_rx);
 
     // The client saw exactly one `$/cancel_request` (for the permission
     // request), with the ID of that request on the client's own connection.
     let permission_id = next_with_timeout(&mut permission_id_rx).await;
     let observed = next_with_timeout(&mut client_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), permission_id);
+    assert_eq!(observed, permission_id);
     assert_no_event(&mut client_cancel_rx);
 
     // The barrier prompt's session update was transformed by the arrow proxy.
@@ -668,7 +675,7 @@ async fn session_new_cancellation_propagates_through_proxy() -> Result<(), Error
                         responder: Responder<NewSessionResponse>,
                         cx: ConnectionTo<Client>| {
                 if request.cwd.ends_with("park-session") {
-                    parked_id_tx.unbounded_send(responder.id()).unwrap();
+                    parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -724,7 +731,7 @@ async fn session_new_cancellation_propagates_through_proxy() -> Result<(), Error
 
                     let request: SentRequest<NewSessionResponse> =
                         cx.send_request(NewSessionRequest::new("/park-session"));
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -760,7 +767,7 @@ async fn session_new_cancellation_propagates_through_proxy() -> Result<(), Error
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut agent_cancel_rx);
 
     conductor_handle.abort();
@@ -787,7 +794,7 @@ async fn proxy_session_helper_cancellation_propagates_to_agent() -> Result<(), E
                         responder: Responder<NewSessionResponse>,
                         cx: ConnectionTo<Client>| {
                 if request.cwd.ends_with("park-session") {
-                    parked_id_tx.unbounded_send(responder.id()).unwrap();
+                    parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -852,7 +859,7 @@ async fn proxy_session_helper_cancellation_propagates_to_agent() -> Result<(), E
 
                     let request: SentRequest<NewSessionResponse> =
                         cx.send_request(NewSessionRequest::new("/park-session"));
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -884,7 +891,7 @@ async fn proxy_session_helper_cancellation_propagates_to_agent() -> Result<(), E
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut agent_cancel_rx);
 
     conductor_handle.abort();
@@ -900,7 +907,7 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
     let (parked_id_tx, mut parked_id_rx) = mpsc::unbounded();
     let (mcp_connect_tx, mut mcp_connect_rx) = mpsc::unbounded();
     let (probe_barrier_tx, mut probe_barrier_rx) = mpsc::unbounded();
-    let cancelled_mcp_acp_id = Arc::new(Mutex::new(None::<String>));
+    let cancelled_mcp_server_id = Arc::new(Mutex::new(None::<McpServerAcpId>));
 
     let agent = Agent
         .builder()
@@ -912,23 +919,23 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
         )
         .on_receive_request(
             {
-                let cancelled_mcp_acp_id = cancelled_mcp_acp_id.clone();
+                let cancelled_mcp_server_id = cancelled_mcp_server_id.clone();
                 let parked_id_tx = parked_id_tx.clone();
                 let probe_barrier_tx = probe_barrier_tx.clone();
                 async move |request: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
-                    let cancelled_mcp_acp_id = cancelled_mcp_acp_id.clone();
+                    let cancelled_mcp_server_id = cancelled_mcp_server_id.clone();
                     let parked_id_tx = parked_id_tx.clone();
                     let probe_barrier_tx = probe_barrier_tx.clone();
-                    let advertised_mcp_acp_id = advertised_mcp_acp_id(&request);
+                    let advertised_mcp_server_id = advertised_mcp_server_id(&request);
 
                     if request.cwd.ends_with("park-session") {
-                        *cancelled_mcp_acp_id
+                        *cancelled_mcp_server_id
                             .lock()
                             .expect("cancelled MCP ID mutex poisoned") =
-                            Some(advertised_mcp_acp_id);
-                        parked_id_tx.unbounded_send(responder.id()).unwrap();
+                            Some(advertised_mcp_server_id);
+                        parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                         let cancellation = responder.cancellation();
                         cx.spawn(async move {
                             let response = cancellation
@@ -943,7 +950,7 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
 
                     responder.respond(NewSessionResponse::new(SessionId::new("normal-session")))?;
 
-                    let stale_acp_id = cancelled_mcp_acp_id
+                    let stale_server_id = cancelled_mcp_server_id
                         .lock()
                         .expect("cancelled MCP ID mutex poisoned")
                         .clone()
@@ -951,10 +958,7 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
                     let connection = cx.clone();
                     cx.spawn(async move {
                         connection
-                            .send_request(McpConnectRequest {
-                                acp_id: stale_acp_id,
-                                meta: None,
-                            })
+                            .send_request(ConnectMcpRequest::new(stale_server_id))
                             .on_receiving_result(async |_| Ok(()))?;
 
                         let barrier = connection
@@ -1048,7 +1052,7 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
 
                     let request: SentRequest<NewSessionResponse> =
                         cx.send_request(NewSessionRequest::new("/park-session"));
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -1082,7 +1086,7 @@ async fn proxy_session_helper_cleans_up_mcp_handlers_after_cancelled_session() -
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut agent_cancel_rx);
 
     assert_eq!(
@@ -1112,7 +1116,7 @@ async fn initialize_cancellation_propagates_through_proxy() -> Result<(), Error>
                         responder: Responder<InitializeResponse>,
                         cx: ConnectionTo<Client>| {
                 if !parked_first.swap(true, Ordering::SeqCst) {
-                    parked_id_tx.unbounded_send(responder.id()).unwrap();
+                    parked_id_tx.unbounded_send(responder.id().clone()).unwrap();
                     let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let response = cancellation
@@ -1166,7 +1170,7 @@ async fn initialize_cancellation_propagates_through_proxy() -> Result<(), Error>
                 async |cx| {
                     let request: SentRequest<InitializeResponse> =
                         cx.send_request(InitializeRequest::new(ProtocolVersion::V1));
-                    let client_request_id = request.id();
+                    let client_request_id = request.id().clone();
                     request.cancel()?;
 
                     let error = request
@@ -1200,7 +1204,7 @@ async fn initialize_cancellation_propagates_through_proxy() -> Result<(), Error>
         "each hop must re-issue the request under its own ID"
     );
     let observed = next_with_timeout(&mut agent_cancel_rx).await;
-    assert_eq!(serde_json::to_value(observed).unwrap(), parked_id);
+    assert_eq!(observed, parked_id);
     assert_no_event(&mut agent_cancel_rx);
 
     conductor_handle.abort();

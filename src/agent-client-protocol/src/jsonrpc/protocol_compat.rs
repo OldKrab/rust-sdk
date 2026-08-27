@@ -1,7 +1,8 @@
 #[cfg(not(feature = "unstable_protocol_v2"))]
 mod imp {
     #![allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    use crate::UntypedMessage;
+    use crate::schema::v1::RequestId;
+    use crate::{UntypedMessage, role::RemoteStyle};
 
     #[derive(Clone, Copy, Debug, Default)]
     pub(crate) struct ProtocolMode;
@@ -16,6 +17,10 @@ mod imp {
         }
 
         pub(crate) fn v1_client() -> Self {
+            Self
+        }
+
+        pub(crate) fn v1_proxy() -> Self {
             Self
         }
 
@@ -39,9 +44,18 @@ mod imp {
             Ok(message)
         }
 
+        pub(crate) fn incoming_request(
+            &self,
+            _id: &RequestId,
+            message: UntypedMessage,
+        ) -> Result<UntypedMessage, crate::Error> {
+            self.incoming_message(message)
+        }
+
         pub(crate) fn outgoing_message(
             &self,
             message: UntypedMessage,
+            _remote_style: RemoteStyle,
         ) -> Result<UntypedMessage, crate::Error> {
             Ok(message)
         }
@@ -75,6 +89,15 @@ mod imp {
         ) -> Result<serde_json::Value, crate::Error> {
             result
         }
+
+        pub(crate) fn outgoing_response_to(
+            &self,
+            _id: &RequestId,
+            method: &str,
+            result: Result<serde_json::Value, crate::Error>,
+        ) -> Result<serde_json::Value, crate::Error> {
+            self.outgoing_response(method, result)
+        }
     }
 }
 
@@ -82,17 +105,8 @@ mod imp {
 mod imp {
     use std::sync::{Arc, Mutex};
 
-    use agent_client_protocol_schema::v2::{
-        self,
-        conversion::{IntoV1, IntoV1Many, IntoV2, v1_to_v2, v2_to_v1, v2_to_v1_many},
-    };
-
-    use crate::schema::ProtocolVersion;
-    use crate::schema::v1::{
-        AgentNotification, AgentRequest, AgentResponse, ClientNotification, ClientRequest,
-        ClientResponse, ErrorCode,
-    };
-    use crate::{JsonRpcMessage, JsonRpcResponse, UntypedMessage};
+    use crate::schema::{ProtocolVersion, v1::RequestId};
+    use crate::{UntypedMessage, role::RemoteStyle};
 
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum ProtocolMode {
@@ -100,11 +114,51 @@ mod imp {
         Acp(AcpProtocolMode),
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct AcpProtocolMode {
         api: ProtocolVersionKind,
-        latest_supported: ProtocolVersionKind,
-        require_latest_response: bool,
+        initialize_surface: InitializeSurface,
+        initialization_role: InitializationRole,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InitializeSurface {
+        Peer,
+        Proxy,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InitializationRole {
+        /// Preserve the v1 and proxy initialization behavior. A v2 proxy has
+        /// both an incoming predecessor initialization and an outgoing
+        /// successor initialization, so the peer lifecycle does not apply to
+        /// it.
+        Unchecked,
+        Initiator,
+        Responder,
+    }
+
+    impl AcpProtocolMode {
+        fn is_incoming_initialize_request(self, method: &str) -> bool {
+            match self.initialize_surface {
+                InitializeSurface::Peer => method == "initialize",
+                InitializeSurface::Proxy => method == "_proxy/initialize",
+            }
+        }
+
+        fn is_incoming_initialize_response(method: &str) -> bool {
+            // Pending replies retain the logical method from before successor
+            // wrapping, so a proxy's downstream initialize response is also
+            // keyed by `initialize`.
+            method == "initialize"
+        }
+
+        fn is_outgoing_initialize_response(self, method: &str) -> bool {
+            match self.initialize_surface {
+                InitializeSurface::Peer => method == "initialize",
+                InitializeSurface::Proxy => method == "_proxy/initialize",
+            }
+        }
     }
 
     impl ProtocolMode {
@@ -115,32 +169,48 @@ mod imp {
         pub(crate) fn v1_agent() -> Self {
             Self::Acp(AcpProtocolMode {
                 api: ProtocolVersionKind::V1,
-                latest_supported: ProtocolVersionKind::V1,
-                require_latest_response: false,
+                initialize_surface: InitializeSurface::Peer,
+                initialization_role: InitializationRole::Unchecked,
             })
         }
 
         pub(crate) fn v1_client() -> Self {
             Self::Acp(AcpProtocolMode {
                 api: ProtocolVersionKind::V1,
-                latest_supported: ProtocolVersionKind::V1,
-                require_latest_response: true,
+                initialize_surface: InitializeSurface::Peer,
+                initialization_role: InitializationRole::Unchecked,
+            })
+        }
+
+        pub(crate) fn v1_proxy() -> Self {
+            Self::Acp(AcpProtocolMode {
+                api: ProtocolVersionKind::V1,
+                initialize_surface: InitializeSurface::Proxy,
+                initialization_role: InitializationRole::Unchecked,
             })
         }
 
         pub(crate) fn v2_agent() -> Self {
             Self::Acp(AcpProtocolMode {
                 api: ProtocolVersionKind::V2,
-                latest_supported: ProtocolVersionKind::V2,
-                require_latest_response: false,
+                initialize_surface: InitializeSurface::Peer,
+                initialization_role: InitializationRole::Responder,
             })
         }
 
         pub(crate) fn v2_client() -> Self {
             Self::Acp(AcpProtocolMode {
                 api: ProtocolVersionKind::V2,
-                latest_supported: ProtocolVersionKind::V2,
-                require_latest_response: true,
+                initialize_surface: InitializeSurface::Peer,
+                initialization_role: InitializationRole::Initiator,
+            })
+        }
+
+        pub(crate) fn v2_proxy() -> Self {
+            Self::Acp(AcpProtocolMode {
+                api: ProtocolVersionKind::V2,
+                initialize_surface: InitializeSurface::Proxy,
+                initialization_role: InitializationRole::Unchecked,
             })
         }
 
@@ -154,12 +224,25 @@ mod imp {
                         "cannot merge ACP builders with different API protocol versions; \
                          handler chains share a single API surface",
                     );
-                    if this.latest_supported >= other.latest_supported {
-                        Self::Acp(this)
-                    } else {
-                        Self::Acp(other)
-                    }
+                    assert_eq!(
+                        this.initialize_surface, other.initialize_surface,
+                        "cannot merge standard ACP and proxy ACP builders; \
+                         handler chains share one initialization surface",
+                    );
+                    assert_eq!(
+                        this.initialization_role, other.initialization_role,
+                        "cannot merge ACP builders with different initialization roles; \
+                         handler chains share one connection lifecycle",
+                    );
+                    Self::Acp(this)
                 }
+            }
+        }
+
+        pub(crate) fn api_protocol_version(self) -> Option<ProtocolVersion> {
+            match self {
+                Self::Disabled => None,
+                Self::Acp(mode) => Some(mode.api.as_protocol_version()),
             }
         }
     }
@@ -174,6 +257,16 @@ mod imp {
     struct ProtocolState {
         negotiated: ProtocolVersionKind,
         pending_initialize: Option<ProtocolVersionKind>,
+        incoming_initialize_id: Option<RequestId>,
+        initialization: InitializationState,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InitializationState {
+        Unchecked,
+        Uninitialized,
+        Initializing,
+        Ready,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -203,50 +296,87 @@ mod imp {
 
     impl ProtocolCompat {
         pub(crate) fn new(mode: ProtocolMode) -> Self {
+            let mode = match mode {
+                ProtocolMode::Disabled => None,
+                ProtocolMode::Acp(mode) => Some(mode),
+            };
+            let negotiated = mode.map_or(ProtocolVersionKind::V1, |mode| mode.api);
+            let initialization = match mode.map(|mode| mode.initialization_role) {
+                Some(InitializationRole::Initiator | InitializationRole::Responder) => {
+                    InitializationState::Uninitialized
+                }
+                Some(InitializationRole::Unchecked) | None => InitializationState::Unchecked,
+            };
+
             Self {
-                mode: match mode {
-                    ProtocolMode::Disabled => None,
-                    ProtocolMode::Acp(mode) => Some(mode),
-                },
+                mode,
                 state: Arc::new(Mutex::new(ProtocolState {
-                    negotiated: ProtocolVersionKind::V1,
+                    negotiated,
                     pending_initialize: None,
+                    incoming_initialize_id: None,
+                    initialization,
                 })),
             }
         }
 
+        #[cfg(test)]
         pub(crate) fn incoming_message(
             &self,
+            message: UntypedMessage,
+        ) -> Result<UntypedMessage, crate::Error> {
+            self.incoming_request(&RequestId::Null, message)
+        }
+
+        pub(crate) fn incoming_request(
+            &self,
+            id: &RequestId,
             message: UntypedMessage,
         ) -> Result<UntypedMessage, crate::Error> {
             let Some(mode) = self.mode else {
                 return Ok(message);
             };
 
-            if message.method() == "initialize" {
-                return self.incoming_initialize_request(mode, message);
+            if mode.is_incoming_initialize_request(message.method()) {
+                return self.incoming_initialize_request(mode, id, message);
+            }
+            if mode.initialize_surface == InitializeSurface::Proxy
+                && (message.method() == "initialize" || successor_encloses_initialize(&message))
+            {
+                return Err(invalid_proxy_initialize_direction());
             }
 
-            convert_message(message, self.active_wire_version(), mode.api)
+            self.ensure_initialized(message.method())?;
+            ensure_matching_protocol_version(
+                message.method(),
+                self.active_wire_version(),
+                mode.api,
+            )?;
+            Ok(message)
         }
 
         pub(crate) fn outgoing_message(
             &self,
             mut message: UntypedMessage,
+            remote_style: RemoteStyle,
         ) -> Result<UntypedMessage, crate::Error> {
             let Some(mode) = self.mode else {
                 return Ok(message);
             };
 
-            let wire_version = if message.method() == "initialize" {
-                set_protocol_version(&mut message.params, mode.latest_supported)?;
-                self.set_pending_initialize(mode.latest_supported);
-                mode.latest_supported
+            let wire_version = if let Some(params) =
+                outgoing_initialize_params(mode, remote_style, &mut message)?
+            {
+                set_protocol_version(params, mode.api)?;
+                validate_native_v2_initialize_request(mode, params)?;
+                self.begin_outgoing_initialize(mode)?;
+                mode.api
             } else {
+                self.ensure_initialized(message.method())?;
                 self.active_wire_version()
             };
 
-            convert_message(message, mode.api, wire_version)
+            ensure_matching_protocol_version(message.method(), mode.api, wire_version)?;
+            Ok(message)
         }
 
         pub(crate) fn incoming_notification(
@@ -257,7 +387,13 @@ mod imp {
                 return Ok(vec![message]);
             };
 
-            convert_notification(message, self.active_wire_version(), mode.api)
+            self.ensure_notification_allowed(message.method())?;
+            ensure_matching_protocol_version(
+                message.method(),
+                self.active_wire_version(),
+                mode.api,
+            )?;
+            Ok(vec![message])
         }
 
         pub(crate) fn outgoing_notification(
@@ -268,7 +404,13 @@ mod imp {
                 return Ok(vec![message]);
             };
 
-            convert_notification(message, mode.api, self.active_wire_version())
+            self.ensure_notification_allowed(message.method())?;
+            ensure_matching_protocol_version(
+                message.method(),
+                mode.api,
+                self.active_wire_version(),
+            )?;
+            Ok(vec![message])
         }
 
         pub(crate) fn incoming_response(
@@ -280,16 +422,28 @@ mod imp {
                 return result;
             };
 
-            if method == "initialize" {
+            if AcpProtocolMode::is_incoming_initialize_response(method) {
                 return self.incoming_initialize_response(mode, result);
             }
 
             let value = result?;
-            convert_response(method, value, self.active_wire_version(), mode.api)
+            self.ensure_initialized(method)?;
+            ensure_matching_protocol_version(method, self.active_wire_version(), mode.api)?;
+            Ok(value)
         }
 
+        #[cfg(test)]
         pub(crate) fn outgoing_response(
             &self,
+            method: &str,
+            result: Result<serde_json::Value, crate::Error>,
+        ) -> Result<serde_json::Value, crate::Error> {
+            self.outgoing_response_to(&RequestId::Null, method, result)
+        }
+
+        pub(crate) fn outgoing_response_to(
+            &self,
+            id: &RequestId,
             method: &str,
             result: Result<serde_json::Value, crate::Error>,
         ) -> Result<serde_json::Value, crate::Error> {
@@ -297,45 +451,67 @@ mod imp {
                 return result;
             };
 
-            // Always drain any pending initialize state so a failed initialize
-            // doesn't leak negotiation state to a subsequent request.
-            let pending_initialize = if method == "initialize" {
-                self.take_pending_initialize()
-            } else {
-                None
-            };
-
-            let mut value = result?;
-
-            let wire_version = if method == "initialize" {
-                let negotiated = pending_initialize.unwrap_or_else(|| {
-                    protocol_version_from_value(&value)
-                        .and_then(ProtocolVersionKind::from_protocol_version)
-                        .unwrap_or(mode.latest_supported)
+            if mode.is_outgoing_initialize_response(method) {
+                match mode.initialization_role {
+                    InitializationRole::Initiator => {
+                        return result.and_then(|_| {
+                            Err(unexpected_initialize_response(mode.initialization_role))
+                        });
+                    }
+                    InitializationRole::Responder if !self.is_pending_incoming_initialize(id) => {
+                        return result.and_then(|_| {
+                            Err(unexpected_initialize_response(mode.initialization_role))
+                        });
+                    }
+                    InitializationRole::Unchecked | InitializationRole::Responder => {}
+                }
+                let mut value = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.fail_initialize();
+                        return Err(error);
+                    }
+                };
+                let negotiated = self.pending_initialize().or_else(|| {
+                    (mode.initialization_role == InitializationRole::Unchecked).then_some(mode.api)
                 });
-                set_protocol_version(&mut value, negotiated)?;
-                self.set_negotiated(negotiated);
-                negotiated
-            } else {
-                self.active_wire_version()
-            };
+                let negotiated = negotiated
+                    .ok_or_else(|| unexpected_initialize_response(mode.initialization_role))?;
+                if let Err(error) = ensure_matching_protocol_version(method, mode.api, negotiated)
+                    .and_then(|()| set_protocol_version(&mut value, negotiated))
+                    .and_then(|()| validate_native_v2_initialize_response(mode, &value))
+                {
+                    self.fail_initialize();
+                    return Err(error);
+                }
+                self.complete_initialize(negotiated)?;
+                return Ok(value);
+            }
 
-            convert_response(method, value, mode.api, wire_version)
+            let value = result?;
+            self.ensure_initialized(method)?;
+            let wire_version = self.active_wire_version();
+
+            ensure_matching_protocol_version(method, mode.api, wire_version)?;
+            Ok(value)
         }
 
         fn incoming_initialize_request(
             &self,
             mode: AcpProtocolMode,
+            id: &RequestId,
             mut message: UntypedMessage,
         ) -> Result<UntypedMessage, crate::Error> {
             let requested = required_protocol_version_from_value(message.params())?;
-            let requested_kind = ProtocolVersionKind::from_protocol_version(requested);
-            let wire_version = requested_kind.unwrap_or(mode.latest_supported);
-            let negotiated = self.negotiate(requested);
-            self.set_pending_initialize(negotiated);
+            let requested_kind = ProtocolVersionKind::from_protocol_version(requested)
+                .ok_or_else(|| unsupported_protocol_version(requested, mode.api))?;
+            if requested_kind != mode.api {
+                return Err(unsupported_protocol_version(requested, mode.api));
+            }
 
-            message = convert_message(message, wire_version, mode.api)?;
             set_protocol_version(&mut message.params, mode.api)?;
+            validate_native_v2_initialize_request(mode, message.params())?;
+            self.begin_incoming_initialize(mode, id)?;
             Ok(message)
         }
 
@@ -344,49 +520,171 @@ mod imp {
             mode: AcpProtocolMode,
             result: Result<serde_json::Value, crate::Error>,
         ) -> Result<serde_json::Value, crate::Error> {
-            let _pending_initialize = self.take_pending_initialize();
-            let mut value = result?;
-            let response_version = required_protocol_version_from_value(&value)?;
-            if !self.supports(response_version) {
-                return Err(unsupported_protocol_version(response_version));
-            }
+            let mut value = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.fail_initialize();
+                    return Err(error);
+                }
+            };
+            let response = (|| {
+                let pending = self.pending_initialize().or_else(|| {
+                    (mode.initialization_role == InitializationRole::Unchecked).then_some(mode.api)
+                });
+                let pending = pending
+                    .ok_or_else(|| unexpected_initialize_response(mode.initialization_role))?;
+                let response_version = required_protocol_version_from_value(&value)?;
+                let wire_version = ProtocolVersionKind::from_protocol_version(response_version)
+                    .ok_or_else(|| unsupported_protocol_version(response_version, mode.api))?;
+                if wire_version != mode.api {
+                    return Err(required_protocol_version(mode.api, wire_version));
+                }
+                ensure_matching_protocol_version("initialize", pending, wire_version)?;
+                set_protocol_version(&mut value, wire_version)?;
+                validate_native_v2_initialize_response(mode, &value)?;
+                Ok(wire_version)
+            })();
 
-            let wire_version = ProtocolVersionKind::from_protocol_version(response_version)
-                .ok_or_else(|| unsupported_protocol_version(response_version))?;
-            if mode.require_latest_response && wire_version != mode.latest_supported {
-                return Err(required_protocol_version(
-                    mode.latest_supported,
-                    wire_version,
+            match response {
+                Ok(wire_version) => {
+                    self.complete_initialize(wire_version)?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    self.fail_initialize();
+                    Err(error)
+                }
+            }
+        }
+
+        fn begin_incoming_initialize(
+            &self,
+            mode: AcpProtocolMode,
+            id: &RequestId,
+        ) -> Result<(), crate::Error> {
+            match mode.initialization_role {
+                InitializationRole::Initiator => return Err(invalid_initialize_direction()),
+                InitializationRole::Unchecked | InitializationRole::Responder => {}
+            }
+            self.begin_initialize(mode.api, Some(id))
+        }
+
+        fn begin_outgoing_initialize(&self, mode: AcpProtocolMode) -> Result<(), crate::Error> {
+            match mode.initialization_role {
+                InitializationRole::Responder => return Err(invalid_initialize_direction()),
+                InitializationRole::Unchecked | InitializationRole::Initiator => {}
+            }
+            self.begin_initialize(mode.api, None)
+        }
+
+        fn begin_initialize(
+            &self,
+            requested: ProtocolVersionKind,
+            incoming_id: Option<&RequestId>,
+        ) -> Result<(), crate::Error> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned");
+            match state.initialization {
+                InitializationState::Unchecked => {
+                    state.pending_initialize = Some(requested);
+                    Ok(())
+                }
+                InitializationState::Uninitialized => {
+                    state.initialization = InitializationState::Initializing;
+                    state.pending_initialize = Some(requested);
+                    state.incoming_initialize_id = incoming_id.cloned();
+                    Ok(())
+                }
+                InitializationState::Initializing => Err(crate::Error::invalid_request()
+                    .data("ACP initialization is already in progress on this connection")),
+                InitializationState::Ready => Err(crate::Error::invalid_request().data(
+                    "ACP connections may only be initialized once; reconnect to initialize again",
+                )),
+            }
+        }
+
+        fn ensure_initialized(&self, method: &str) -> Result<(), crate::Error> {
+            let state = self
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned")
+                .initialization;
+            match state {
+                InitializationState::Unchecked | InitializationState::Ready => Ok(()),
+                InitializationState::Uninitialized | InitializationState::Initializing => {
+                    Err(crate::Error::invalid_request().data(format!(
+                        "ACP initialization must complete before `{method}` can be used",
+                    )))
+                }
+            }
+        }
+
+        fn ensure_notification_allowed(&self, method: &str) -> Result<(), crate::Error> {
+            let initialization = self
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned")
+                .initialization;
+            if initialization == InitializationState::Initializing && method == "$/cancel_request" {
+                return Ok(());
+            }
+            self.ensure_initialized(method)
+        }
+
+        fn complete_initialize(&self, negotiated: ProtocolVersionKind) -> Result<(), crate::Error> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned");
+            if state.pending_initialize.is_none()
+                && state.initialization != InitializationState::Unchecked
+            {
+                return Err(unexpected_initialize_response(
+                    self.mode
+                        .expect("protocol initialization requires an ACP mode")
+                        .initialization_role,
                 ));
             }
-            self.set_negotiated(wire_version);
-
-            value = convert_response("initialize", value, wire_version, mode.api)?;
-            set_protocol_version(&mut value, wire_version)?;
-            Ok(value)
-        }
-
-        fn supports(&self, version: ProtocolVersion) -> bool {
-            let Some(mode) = self.mode else {
-                return false;
-            };
-
-            version == ProtocolVersion::V1
-                || (mode.latest_supported == ProtocolVersionKind::V2
-                    && version == ProtocolVersion::V2)
-        }
-
-        fn negotiate(&self, requested: ProtocolVersion) -> ProtocolVersionKind {
-            let mode = self
-                .mode
-                .expect("ACP protocol mode should be enabled while negotiating");
-
-            if self.supports(requested) {
-                ProtocolVersionKind::from_protocol_version(requested)
-                    .unwrap_or(mode.latest_supported)
-            } else {
-                mode.latest_supported
+            if !matches!(
+                state.initialization,
+                InitializationState::Unchecked | InitializationState::Initializing
+            ) {
+                return Err(unexpected_initialize_response(
+                    self.mode
+                        .expect("protocol initialization requires an ACP mode")
+                        .initialization_role,
+                ));
             }
+            state.pending_initialize = None;
+            state.incoming_initialize_id = None;
+            state.negotiated = negotiated;
+            if state.initialization == InitializationState::Initializing {
+                state.initialization = InitializationState::Ready;
+            }
+            Ok(())
+        }
+
+        fn fail_initialize(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned");
+            state.pending_initialize = None;
+            state.incoming_initialize_id = None;
+            if state.initialization == InitializationState::Initializing {
+                state.initialization = InitializationState::Uninitialized;
+            }
+        }
+
+        fn is_pending_incoming_initialize(&self, id: &RequestId) -> bool {
+            self.state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned")
+                .incoming_initialize_id
+                .as_ref()
+                == Some(id)
         }
 
         fn active_wire_version(&self) -> ProtocolVersionKind {
@@ -397,31 +695,12 @@ mod imp {
             state.pending_initialize.unwrap_or(state.negotiated)
         }
 
-        fn set_negotiated(&self, negotiated: ProtocolVersionKind) {
-            self.state
-                .lock()
-                .expect("protocol compatibility state mutex poisoned")
-                .negotiated = negotiated;
-        }
-
-        fn set_pending_initialize(&self, negotiated: ProtocolVersionKind) {
-            self.state
-                .lock()
-                .expect("protocol compatibility state mutex poisoned")
-                .pending_initialize = Some(negotiated);
-        }
-
-        fn take_pending_initialize(&self) -> Option<ProtocolVersionKind> {
+        fn pending_initialize(&self) -> Option<ProtocolVersionKind> {
             self.state
                 .lock()
                 .expect("protocol compatibility state mutex poisoned")
                 .pending_initialize
-                .take()
         }
-    }
-
-    fn protocol_version_from_value(value: &serde_json::Value) -> Option<ProtocolVersion> {
-        serde_json::from_value(value.get("protocolVersion")?.clone()).ok()
     }
 
     fn required_protocol_version_from_value(
@@ -434,274 +713,154 @@ mod imp {
         serde_json::from_value(version.clone()).map_err(|_| invalid_initialize_protocol_version())
     }
 
+    fn outgoing_initialize_params(
+        mode: AcpProtocolMode,
+        remote_style: RemoteStyle,
+        message: &mut UntypedMessage,
+    ) -> Result<Option<&mut serde_json::Value>, crate::Error> {
+        if successor_encloses_initialize(message) {
+            return Err(invalid_prewrapped_initialize());
+        }
+
+        match mode.initialize_surface {
+            InitializeSurface::Peer => {
+                Ok((message.method() == "initialize").then_some(&mut message.params))
+            }
+            InitializeSurface::Proxy => {
+                if message.method() == "initialize" {
+                    if remote_style != RemoteStyle::Successor {
+                        return Err(invalid_proxy_initialize_direction());
+                    }
+                    return Ok(Some(&mut message.params));
+                }
+                if message.method() == "_proxy/initialize" {
+                    return Err(invalid_proxy_initialize_direction());
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn successor_encloses_initialize(message: &UntypedMessage) -> bool {
+        let mut method = message.method();
+        let mut params = message.params();
+        let mut wrapped = false;
+
+        while method == "_proxy/successor" {
+            wrapped = true;
+            let Some(inner_method) = params.get("method").and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            method = inner_method;
+            if method == "_proxy/successor" {
+                let Some(inner_params) = params.get("params") else {
+                    return false;
+                };
+                params = inner_params;
+            }
+        }
+
+        wrapped && matches!(method, "initialize" | "_proxy/initialize")
+    }
+
     fn invalid_initialize_protocol_version() -> crate::Error {
         crate::Error::invalid_params()
             .data("initialize.protocolVersion must be a valid ACP protocol version")
+    }
+
+    fn invalid_initialize_direction() -> crate::Error {
+        crate::Error::invalid_request()
+            .data("ACP clients send `initialize` requests and ACP agents respond to them")
+    }
+
+    fn unexpected_initialize_response(role: InitializationRole) -> crate::Error {
+        let detail = match role {
+            InitializationRole::Initiator => "before an initialize request is pending",
+            InitializationRole::Responder => "before an initialize request was received",
+            InitializationRole::Unchecked => "without a pending initialize request",
+        };
+        crate::Error::invalid_request().data(format!("received an initialize response {detail}"))
+    }
+
+    fn invalid_proxy_initialize_direction() -> crate::Error {
+        crate::Error::invalid_request().data(
+            "proxy initialization must arrive as `_proxy/initialize`; outgoing `initialize` must target the successor so the connection can apply `_proxy/successor`",
+        )
+    }
+
+    fn invalid_prewrapped_initialize() -> crate::Error {
+        crate::Error::invalid_request().data(
+            "initialize requests must be sent as a logical `initialize` message; `_proxy/successor` wrapping is applied by connection routing",
+        )
     }
 
     fn set_protocol_version(
         value: &mut serde_json::Value,
         version: ProtocolVersionKind,
     ) -> Result<(), crate::Error> {
-        if let serde_json::Value::Object(object) = value {
-            object.insert(
-                "protocolVersion".into(),
-                serde_json::to_value(version.as_protocol_version())
-                    .map_err(crate::Error::into_internal_error)?,
-            );
-        }
+        let serde_json::Value::Object(object) = value else {
+            return Err(invalid_initialize_protocol_version());
+        };
+        object.insert(
+            "protocolVersion".into(),
+            serde_json::to_value(version.as_protocol_version())
+                .map_err(crate::Error::into_internal_error)?,
+        );
         Ok(())
     }
 
-    fn convert_message(
-        message: UntypedMessage,
+    fn validate_native_v2_initialize_request(
+        mode: AcpProtocolMode,
+        value: &serde_json::Value,
+    ) -> Result<(), crate::Error> {
+        if mode.initialization_role == InitializationRole::Unchecked {
+            return Ok(());
+        }
+        <crate::schema::v2::InitializeRequest as crate::JsonRpcMessage>::parse_message(
+            "initialize",
+            value,
+        )?;
+        Ok(())
+    }
+
+    fn validate_native_v2_initialize_response(
+        mode: AcpProtocolMode,
+        value: &serde_json::Value,
+    ) -> Result<(), crate::Error> {
+        if mode.initialization_role == InitializationRole::Unchecked {
+            return Ok(());
+        }
+        <crate::schema::v2::InitializeResponse as crate::JsonRpcResponse>::from_value(
+            "initialize",
+            value.clone(),
+        )?;
+        Ok(())
+    }
+
+    fn ensure_matching_protocol_version(
+        method: &str,
         from: ProtocolVersionKind,
         to: ProtocolVersionKind,
-    ) -> Result<UntypedMessage, crate::Error> {
-        if message.method().starts_with('_') || from == to {
-            return Ok(message);
+    ) -> Result<(), crate::Error> {
+        if from == to {
+            return Ok(());
         }
 
-        match (from, to) {
-            (ProtocolVersionKind::V1, ProtocolVersionKind::V2) => public_to_v2_message(message),
-            (ProtocolVersionKind::V2, ProtocolVersionKind::V1) => v2_to_public_message(message),
-            _ => Ok(message),
-        }
+        Err(crate::Error::invalid_request().data(format!(
+            "ACP protocol translation from {} to {} is not supported for `{method}`; register a handler for the negotiated protocol version",
+            from.as_protocol_version(),
+            to.as_protocol_version(),
+        )))
     }
 
-    fn convert_response(
-        method: &str,
-        value: serde_json::Value,
-        from: ProtocolVersionKind,
-        to: ProtocolVersionKind,
-    ) -> Result<serde_json::Value, crate::Error> {
-        if method.starts_with('_') || from == to {
-            return Ok(value);
-        }
-
-        match (from, to) {
-            (ProtocolVersionKind::V1, ProtocolVersionKind::V2) => {
-                public_to_v2_response(method, value)
-            }
-            (ProtocolVersionKind::V2, ProtocolVersionKind::V1) => {
-                v2_to_public_response(method, value)
-            }
-            _ => Ok(value),
-        }
-    }
-
-    fn convert_notification(
-        message: UntypedMessage,
-        from: ProtocolVersionKind,
-        to: ProtocolVersionKind,
-    ) -> Result<Vec<UntypedMessage>, crate::Error> {
-        if message.method().starts_with('_') || from == to {
-            return Ok(vec![message]);
-        }
-
-        match (from, to) {
-            (ProtocolVersionKind::V1, ProtocolVersionKind::V2) => {
-                public_to_v2_notification(message)
-            }
-            (ProtocolVersionKind::V2, ProtocolVersionKind::V1) => {
-                v2_to_public_notification(message)
-            }
-            _ => Ok(vec![message]),
-        }
-    }
-
-    fn public_to_v2_notification(
-        message: UntypedMessage,
-    ) -> Result<Vec<UntypedMessage>, crate::Error> {
-        public_to_v2_message(message).map(|message| vec![message])
-    }
-
-    fn v2_to_public_notification(
-        message: UntypedMessage,
-    ) -> Result<Vec<UntypedMessage>, crate::Error> {
-        let UntypedMessage { method, params } = message;
-
-        if let Some(message) =
-            try_convert_message_to_v1::<v2::ClientNotification>(&method, &params)?
-        {
-            return Ok(vec![message]);
-        }
-        if let Some(messages) =
-            try_convert_message_to_v1_many::<v2::AgentNotification>(&method, &params)?
-        {
-            return Ok(messages);
-        }
-
-        Ok(vec![UntypedMessage { method, params }])
-    }
-
-    fn public_to_v2_message(message: UntypedMessage) -> Result<UntypedMessage, crate::Error> {
-        let UntypedMessage { method, params } = message;
-
-        if let Some(message) = try_convert_message_to_v2::<ClientRequest>(&method, &params)? {
-            return Ok(message);
-        }
-        if let Some(message) = try_convert_message_to_v2::<AgentRequest>(&method, &params)? {
-            return Ok(message);
-        }
-        if let Some(message) = try_convert_message_to_v2::<ClientNotification>(&method, &params)? {
-            return Ok(message);
-        }
-        if let Some(message) = try_convert_message_to_v2::<AgentNotification>(&method, &params)? {
-            return Ok(message);
-        }
-
-        Ok(UntypedMessage { method, params })
-    }
-
-    fn v2_to_public_message(message: UntypedMessage) -> Result<UntypedMessage, crate::Error> {
-        let UntypedMessage { method, params } = message;
-
-        if let Some(message) = try_convert_message_to_v1::<v2::ClientRequest>(&method, &params)? {
-            return Ok(message);
-        }
-        if let Some(message) = try_convert_message_to_v1::<v2::AgentRequest>(&method, &params)? {
-            return Ok(message);
-        }
-        if let Some(message) =
-            try_convert_message_to_v1::<v2::ClientNotification>(&method, &params)?
-        {
-            return Ok(message);
-        }
-        Ok(UntypedMessage { method, params })
-    }
-
-    fn public_to_v2_response(
-        method: &str,
-        value: serde_json::Value,
-    ) -> Result<serde_json::Value, crate::Error> {
-        if let Some(value) = try_convert_response_to_v2::<AgentResponse>(method, &value)? {
-            return Ok(value);
-        }
-        if let Some(value) = try_convert_response_to_v2::<ClientResponse>(method, &value)? {
-            return Ok(value);
-        }
-
-        Ok(value)
-    }
-
-    fn v2_to_public_response(
-        method: &str,
-        value: serde_json::Value,
-    ) -> Result<serde_json::Value, crate::Error> {
-        if let Some(value) = try_convert_response_to_v1::<v2::AgentResponse>(method, &value)? {
-            return Ok(value);
-        }
-        if let Some(value) = try_convert_response_to_v1::<v2::ClientResponse>(method, &value)? {
-            return Ok(value);
-        }
-
-        Ok(value)
-    }
-
-    fn try_convert_message_to_v2<T>(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Option<UntypedMessage>, crate::Error>
-    where
-        T: JsonRpcMessage + IntoV2,
-        T::Output: JsonRpcMessage,
-    {
-        let Some(message) = try_parse_message::<T>(method, params)? else {
-            return Ok(None);
-        };
-        let wire_message = v1_to_v2(message)?;
-        wire_message.to_untyped_message().map(Some)
-    }
-
-    fn try_convert_message_to_v1<T>(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Option<UntypedMessage>, crate::Error>
-    where
-        T: JsonRpcMessage + IntoV1,
-        T::Output: JsonRpcMessage,
-    {
-        let Some(message) = try_parse_message::<T>(method, params)? else {
-            return Ok(None);
-        };
-        let public_message = v2_to_v1(message)?;
-        public_message.to_untyped_message().map(Some)
-    }
-
-    fn try_convert_message_to_v1_many<T>(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Option<Vec<UntypedMessage>>, crate::Error>
-    where
-        T: JsonRpcMessage + IntoV1Many,
-        T::Output: JsonRpcMessage,
-    {
-        let Some(message) = try_parse_message::<T>(method, params)? else {
-            return Ok(None);
-        };
-        v2_to_v1_many(message)?
-            .into_iter()
-            .map(|public_message| public_message.to_untyped_message())
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
-    }
-
-    fn try_parse_message<T: JsonRpcMessage>(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Option<T>, crate::Error> {
-        match T::parse_message(method, params) {
-            Ok(message) => Ok(Some(message)),
-            Err(error) if error.code == ErrorCode::MethodNotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn try_convert_response_to_v2<T>(
-        method: &str,
-        value: &serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, crate::Error>
-    where
-        T: JsonRpcResponse + IntoV2,
-        T::Output: JsonRpcResponse,
-    {
-        let Some(response) = try_parse_response::<T>(method, value)? else {
-            return Ok(None);
-        };
-        let wire_response = v1_to_v2(response)?;
-        wire_response.into_json(method).map(Some)
-    }
-
-    fn try_convert_response_to_v1<T>(
-        method: &str,
-        value: &serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, crate::Error>
-    where
-        T: JsonRpcResponse + IntoV1,
-        T::Output: JsonRpcResponse,
-    {
-        let Some(response) = try_parse_response::<T>(method, value)? else {
-            return Ok(None);
-        };
-        let public_response = v2_to_v1(response)?;
-        public_response.into_json(method).map(Some)
-    }
-
-    fn try_parse_response<T: JsonRpcResponse>(
-        method: &str,
-        value: &serde_json::Value,
-    ) -> Result<Option<T>, crate::Error> {
-        match T::from_value(method, value.clone()) {
-            Ok(response) => Ok(Some(response)),
-            Err(error) if error.code == ErrorCode::MethodNotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn unsupported_protocol_version(version: ProtocolVersion) -> crate::Error {
+    fn unsupported_protocol_version(
+        version: ProtocolVersion,
+        supported: ProtocolVersionKind,
+    ) -> crate::Error {
         crate::Error::invalid_request().data(format!(
-            "unsupported ACP protocol version {version}; this endpoint does not support that version"
+            "unsupported ACP protocol version {version}; this endpoint only supports ACP protocol version {}",
+            supported.as_protocol_version(),
         ))
     }
 
@@ -710,7 +869,7 @@ mod imp {
         negotiated: ProtocolVersionKind,
     ) -> crate::Error {
         crate::Error::invalid_request().data(format!(
-            "required ACP protocol version {} but peer negotiated {}; use a v1 client implementation for v1 agents",
+            "required ACP protocol version {} but peer negotiated {}; use a matching implementation for the negotiated protocol version",
             required.as_protocol_version(),
             negotiated.as_protocol_version(),
         ))
@@ -719,6 +878,7 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use agent_client_protocol_schema::v2;
 
         fn negotiated(compat: &ProtocolCompat) -> ProtocolVersionKind {
             compat
@@ -728,29 +888,66 @@ mod imp {
                 .negotiated
         }
 
+        fn pending_initialize(compat: &ProtocolCompat) -> Option<ProtocolVersionKind> {
+            compat
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned")
+                .pending_initialize
+        }
+
+        fn initialization_state(compat: &ProtocolCompat) -> InitializationState {
+            compat
+                .state
+                .lock()
+                .expect("protocol compatibility state mutex poisoned")
+                .initialization
+        }
+
+        fn v2_implementation() -> v2::Implementation {
+            v2::Implementation::new("protocol-compat-test", env!("CARGO_PKG_VERSION"))
+        }
+
+        fn v2_initialize_request(protocol_version: ProtocolVersion) -> v2::InitializeRequest {
+            v2::InitializeRequest::new(protocol_version, v2_implementation())
+        }
+
+        fn v2_initialize_response(protocol_version: ProtocolVersion) -> v2::InitializeResponse {
+            v2::InitializeResponse::new(protocol_version, v2_implementation())
+        }
+
         #[test]
         fn initialize_request_sets_active_wire_version_before_response() -> Result<(), crate::Error>
         {
             let compat = ProtocolCompat::new(ProtocolMode::v2_agent());
-            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V1);
+            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Uninitialized
+            );
 
             compat.incoming_message(UntypedMessage::new(
                 "initialize",
-                v2::InitializeRequest::new(ProtocolVersion::V2),
+                v2_initialize_request(ProtocolVersion::V2),
             )?)?;
 
-            assert_eq!(negotiated(&compat), ProtocolVersionKind::V1);
+            assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
             assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
 
             compat.outgoing_response(
                 "initialize",
-                Ok(serde_json::to_value(v2::InitializeResponse::new(
+                Ok(serde_json::to_value(v2_initialize_response(
                     ProtocolVersion::V2,
                 ))?),
             )?;
 
             assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
             assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(initialization_state(&compat), InitializationState::Ready);
             Ok(())
         }
 
@@ -758,25 +955,34 @@ mod imp {
         fn outgoing_initialize_sets_active_wire_version_before_response() -> Result<(), crate::Error>
         {
             let compat = ProtocolCompat::new(ProtocolMode::v2_client());
-            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V1);
-
-            compat.outgoing_message(UntypedMessage::new(
-                "initialize",
-                v2::InitializeRequest::new(ProtocolVersion::V1),
-            )?)?;
-
-            assert_eq!(negotiated(&compat), ProtocolVersionKind::V1);
             assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Uninitialized
+            );
+
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V1))?,
+                RemoteStyle::Counterpart,
+            )?;
+
+            assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
+            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
 
             compat.incoming_response(
                 "initialize",
-                Ok(serde_json::to_value(v2::InitializeResponse::new(
+                Ok(serde_json::to_value(v2_initialize_response(
                     ProtocolVersion::V2,
                 ))?),
             )?;
 
             assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
             assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(initialization_state(&compat), InitializationState::Ready);
             Ok(())
         }
 
@@ -784,14 +990,14 @@ mod imp {
         fn failed_incoming_initialize_response_clears_pending_wire_version()
         -> Result<(), crate::Error> {
             let compat = ProtocolCompat::new(ProtocolMode::v2_client());
-            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V1);
+            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
 
-            compat.outgoing_message(UntypedMessage::new(
-                "initialize",
-                v2::InitializeRequest::new(ProtocolVersion::V1),
-            )?)?;
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V1))?,
+                RemoteStyle::Counterpart,
+            )?;
 
-            assert_eq!(negotiated(&compat), ProtocolVersionKind::V1);
+            assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
             assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
 
             let result = compat.incoming_response(
@@ -800,8 +1006,20 @@ mod imp {
             );
 
             assert!(result.is_err());
-            assert_eq!(negotiated(&compat), ProtocolVersionKind::V1);
-            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V1);
+            assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
+            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Uninitialized
+            );
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
             Ok(())
         }
 
@@ -812,10 +1030,10 @@ mod imp {
                 serde_json::json!({ "protocolVersion": 100_000 }),
             ] {
                 let compat = ProtocolCompat::new(ProtocolMode::v2_client());
-                compat.outgoing_message(UntypedMessage::new(
-                    "initialize",
-                    v2::InitializeRequest::new(ProtocolVersion::V1),
-                )?)?;
+                compat.outgoing_message(
+                    UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V1))?,
+                    RemoteStyle::Counterpart,
+                )?;
 
                 let error = compat
                     .incoming_response("initialize", Ok(value))
@@ -826,64 +1044,677 @@ mod imp {
                     .and_then(|data| data.as_str())
                     .unwrap_or_default();
                 assert!(data.contains("protocolVersion"), "{error:?}");
-                assert_eq!(negotiated(&compat), ProtocolVersionKind::V1);
-                assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V1);
+                assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
+                assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+                assert_eq!(
+                    initialization_state(&compat),
+                    InitializationState::Uninitialized
+                );
             }
 
             Ok(())
         }
 
         #[test]
-        fn outgoing_v2_agent_notification_fans_out_for_v1_wire() -> Result<(), crate::Error> {
+        fn malformed_v2_initialize_requests_do_not_begin_a_handshake() -> Result<(), crate::Error> {
+            let malformed = serde_json::json!({ "protocolVersion": ProtocolVersion::V2 });
+
+            let client = ProtocolCompat::new(ProtocolMode::v2_client());
+            client
+                .outgoing_message(
+                    UntypedMessage::new("initialize", malformed.clone())?,
+                    RemoteStyle::Counterpart,
+                )
+                .expect_err("native v2 clients must send the complete initialize request shape");
+            assert_eq!(
+                initialization_state(&client),
+                InitializationState::Uninitialized
+            );
+            client.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+            assert_eq!(
+                initialization_state(&client),
+                InitializationState::Initializing
+            );
+
+            let agent = ProtocolCompat::new(ProtocolMode::v2_agent());
+            agent
+                .incoming_message(UntypedMessage::new("initialize", malformed)?)
+                .expect_err("native v2 agents must receive the complete initialize request shape");
+            assert_eq!(
+                initialization_state(&agent),
+                InitializationState::Uninitialized
+            );
+            agent.incoming_message(UntypedMessage::new(
+                "initialize",
+                v2_initialize_request(ProtocolVersion::V2),
+            )?)?;
+            assert_eq!(
+                initialization_state(&agent),
+                InitializationState::Initializing
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn malformed_v2_initialize_success_leaves_client_uninitialized_for_retry()
+        -> Result<(), crate::Error> {
+            let compat = ProtocolCompat::new(ProtocolMode::v2_client());
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+
+            compat
+                .incoming_response(
+                    "initialize",
+                    Ok(serde_json::json!({ "protocolVersion": ProtocolVersion::V2 })),
+                )
+                .expect_err("initialize success must contain the complete v2 response shape");
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Uninitialized
+            );
+            assert_eq!(pending_initialize(&compat), None);
+
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn malformed_v2_initialize_success_leaves_agent_uninitialized_for_retry()
+        -> Result<(), crate::Error> {
             let compat = ProtocolCompat::new(ProtocolMode::v2_agent());
-            let messages = compat.outgoing_notification(UntypedMessage::new(
-                "session/update",
-                v2::SessionNotification::new(
-                    "sess",
-                    v2::SessionUpdate::AgentMessage(v2::AgentMessage::new("msg_agent").content(
-                        vec![
-                            v2::ContentBlock::Text(v2::TextContent::new("hello")),
-                            v2::ContentBlock::Text(v2::TextContent::new("world")),
-                        ],
-                    )),
-                ),
+            compat.incoming_message(UntypedMessage::new(
+                "initialize",
+                v2_initialize_request(ProtocolVersion::V2),
             )?)?;
 
-            assert_eq!(messages.len(), 2);
-            let json = messages
-                .into_iter()
-                .map(|message| {
-                    assert_eq!(message.method(), "session/update");
-                    Ok(message.params)
-                })
-                .collect::<Result<Vec<_>, crate::Error>>()?;
+            compat
+                .outgoing_response(
+                    "initialize",
+                    Ok(serde_json::json!({ "protocolVersion": ProtocolVersion::V2 })),
+                )
+                .expect_err("initialize success must contain the complete v2 response shape");
             assert_eq!(
-                json,
-                vec![
-                    serde_json::json!({
-                        "sessionId": "sess",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {
-                                "type": "text",
-                                "text": "hello"
-                            },
-                            "messageId": "msg_agent"
-                        }
-                    }),
-                    serde_json::json!({
-                        "sessionId": "sess",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {
-                                "type": "text",
-                                "text": "world"
-                            },
-                            "messageId": "msg_agent"
-                        }
-                    }),
-                ]
+                initialization_state(&compat),
+                InitializationState::Uninitialized
             );
+            assert_eq!(pending_initialize(&compat), None);
+
+            compat.incoming_message(UntypedMessage::new(
+                "initialize",
+                v2_initialize_request(ProtocolVersion::V2),
+            )?)?;
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn v2_peer_traffic_requires_completed_initialization() -> Result<(), crate::Error> {
+            for compat in [
+                ProtocolCompat::new(ProtocolMode::v2_agent()),
+                ProtocolCompat::new(ProtocolMode::v2_client()),
+            ] {
+                for error in [
+                    compat
+                        .incoming_message(UntypedMessage::new(
+                            "session/new",
+                            serde_json::json!({}),
+                        )?)
+                        .expect_err("incoming requests must wait for initialization"),
+                    compat
+                        .outgoing_message(
+                            UntypedMessage::new("session/new", serde_json::json!({}))?,
+                            RemoteStyle::Counterpart,
+                        )
+                        .expect_err("outgoing requests must wait for initialization"),
+                    compat
+                        .incoming_notification(UntypedMessage::new(
+                            "session/update",
+                            serde_json::json!({}),
+                        )?)
+                        .expect_err("incoming notifications must wait for initialization"),
+                    compat
+                        .outgoing_notification(UntypedMessage::new(
+                            "session/update",
+                            serde_json::json!({}),
+                        )?)
+                        .expect_err("outgoing notifications must wait for initialization"),
+                    compat
+                        .incoming_response("session/new", Ok(serde_json::json!({})))
+                        .expect_err("incoming responses must wait for initialization"),
+                    compat
+                        .outgoing_response("session/new", Ok(serde_json::json!({})))
+                        .expect_err("outgoing responses must wait for initialization"),
+                ] {
+                    let data = error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.as_str())
+                        .unwrap_or_default();
+                    assert!(data.contains("initialization must complete"), "{error:?}");
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn v2_initialization_allows_only_protocol_cancellation_notifications()
+        -> Result<(), crate::Error> {
+            let client = ProtocolCompat::new(ProtocolMode::v2_client());
+            client.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+            client.outgoing_notification(UntypedMessage::new(
+                "$/cancel_request",
+                serde_json::json!({ "requestId": 1 }),
+            )?)?;
+            client
+                .outgoing_notification(UntypedMessage::new(
+                    "session/update",
+                    serde_json::json!({}),
+                )?)
+                .expect_err("ordinary notifications must wait for initialization");
+
+            let agent = ProtocolCompat::new(ProtocolMode::v2_agent());
+            agent.incoming_message(UntypedMessage::new(
+                "initialize",
+                v2_initialize_request(ProtocolVersion::V2),
+            )?)?;
+            agent.incoming_notification(UntypedMessage::new(
+                "$/cancel_request",
+                serde_json::json!({ "requestId": 1 }),
+            )?)?;
+            agent
+                .incoming_notification(UntypedMessage::new(
+                    "session/update",
+                    serde_json::json!({}),
+                )?)
+                .expect_err("ordinary notifications must wait for initialization");
+            Ok(())
+        }
+
+        #[test]
+        fn v2_peer_initialization_has_one_direction_and_one_successful_round_trip()
+        -> Result<(), crate::Error> {
+            let agent = ProtocolCompat::new(ProtocolMode::v2_agent());
+            let error = agent
+                .outgoing_message(
+                    UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                    RemoteStyle::Counterpart,
+                )
+                .expect_err("agents must not initiate initialization");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| data.contains("clients send `initialize`")),
+                "{error:?}"
+            );
+            assert_eq!(
+                initialization_state(&agent),
+                InitializationState::Uninitialized
+            );
+
+            agent.incoming_message(UntypedMessage::new(
+                "initialize",
+                v2_initialize_request(ProtocolVersion::V2),
+            )?)?;
+            agent.outgoing_response(
+                "initialize",
+                Ok(serde_json::to_value(v2_initialize_response(
+                    ProtocolVersion::V2,
+                ))?),
+            )?;
+            let error = agent
+                .incoming_message(UntypedMessage::new(
+                    "initialize",
+                    v2_initialize_request(ProtocolVersion::V2),
+                )?)
+                .expect_err("agents must reject reinitialization");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| data.contains("only be initialized once")),
+                "{error:?}"
+            );
+            assert_eq!(initialization_state(&agent), InitializationState::Ready);
+
+            let client = ProtocolCompat::new(ProtocolMode::v2_client());
+            let error = client
+                .incoming_message(UntypedMessage::new(
+                    "initialize",
+                    v2_initialize_request(ProtocolVersion::V2),
+                )?)
+                .expect_err("clients must not receive initialization requests");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| data.contains("clients send `initialize`")),
+                "{error:?}"
+            );
+            assert_eq!(
+                initialization_state(&client),
+                InitializationState::Uninitialized
+            );
+
+            client.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+            client.incoming_response(
+                "initialize",
+                Ok(serde_json::to_value(v2_initialize_response(
+                    ProtocolVersion::V2,
+                ))?),
+            )?;
+            let error = client
+                .outgoing_message(
+                    UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                    RemoteStyle::Counterpart,
+                )
+                .expect_err("clients must reject reinitialization");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| data.contains("only be initialized once")),
+                "{error:?}"
+            );
+            assert_eq!(initialization_state(&client), InitializationState::Ready);
+            Ok(())
+        }
+
+        #[test]
+        fn rejected_concurrent_initialize_does_not_clear_the_active_handshake()
+        -> Result<(), crate::Error> {
+            let compat = ProtocolCompat::new(ProtocolMode::v2_agent());
+            let accepted_id = RequestId::Number(1);
+            let rejected_id = RequestId::Number(2);
+
+            compat.incoming_request(
+                &accepted_id,
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+            )?;
+            let duplicate_error = compat
+                .incoming_request(
+                    &rejected_id,
+                    UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                )
+                .expect_err("a second initialize request must be rejected while one is active");
+            compat
+                .outgoing_response_to(&rejected_id, "initialize", Err(duplicate_error))
+                .expect_err("the rejected initialize receives its own error response");
+
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
+            assert_eq!(pending_initialize(&compat), Some(ProtocolVersionKind::V2));
+
+            compat.outgoing_response_to(
+                &accepted_id,
+                "initialize",
+                Ok(serde_json::to_value(v2_initialize_response(
+                    ProtocolVersion::V2,
+                ))?),
+            )?;
+            assert_eq!(initialization_state(&compat), InitializationState::Ready);
+            Ok(())
+        }
+
+        #[test]
+        fn rejected_wrong_direction_initialize_does_not_clear_client_handshake()
+        -> Result<(), crate::Error> {
+            let compat = ProtocolCompat::new(ProtocolMode::v2_client());
+            compat.outgoing_message(
+                UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                RemoteStyle::Counterpart,
+            )?;
+
+            let wrong_direction_id = RequestId::Number(2);
+            let wrong_direction_error = compat
+                .incoming_request(
+                    &wrong_direction_id,
+                    UntypedMessage::new("initialize", v2_initialize_request(ProtocolVersion::V2))?,
+                )
+                .expect_err("agents must not send initialize requests to clients");
+            compat
+                .outgoing_response_to(
+                    &wrong_direction_id,
+                    "initialize",
+                    Err(wrong_direction_error),
+                )
+                .expect_err("the wrong-direction initialize receives its own error response");
+
+            assert_eq!(
+                initialization_state(&compat),
+                InitializationState::Initializing
+            );
+            assert_eq!(pending_initialize(&compat), Some(ProtocolVersionKind::V2));
+
+            compat.incoming_response(
+                "initialize",
+                Ok(serde_json::to_value(v2_initialize_response(
+                    ProtocolVersion::V2,
+                ))?),
+            )?;
+            assert_eq!(initialization_state(&compat), InitializationState::Ready);
+            Ok(())
+        }
+
+        #[test]
+        fn incoming_initialize_request_rejects_unsupported_protocol_version()
+        -> Result<(), crate::Error> {
+            let compat = ProtocolCompat::new(ProtocolMode::v2_agent());
+            let error = compat
+                .incoming_message(UntypedMessage::new(
+                    "initialize",
+                    v2_initialize_request(ProtocolVersion::V1),
+                )?)
+                .expect_err("v2 agents should reject v1 initialization without a v1 handler");
+            let data = error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .unwrap_or_default();
+            assert!(
+                data.contains("only supports ACP protocol version 2"),
+                "{error:?}"
+            );
+            assert_eq!(negotiated(&compat), ProtocolVersionKind::V2);
+            assert_eq!(compat.active_wire_version(), ProtocolVersionKind::V2);
+
+            Ok(())
+        }
+
+        #[test]
+        fn proxy_initialize_request_requires_the_selected_protocol_version()
+        -> Result<(), crate::Error> {
+            for (mode, selected, unsupported, selected_kind) in [
+                (
+                    ProtocolMode::v1_proxy(),
+                    ProtocolVersion::V1,
+                    ProtocolVersion::V2,
+                    ProtocolVersionKind::V1,
+                ),
+                (
+                    ProtocolMode::v2_proxy(),
+                    ProtocolVersion::V2,
+                    ProtocolVersion::V1,
+                    ProtocolVersionKind::V2,
+                ),
+            ] {
+                let compat = ProtocolCompat::new(mode);
+                let error = compat
+                    .incoming_message(UntypedMessage::new(
+                        "_proxy/initialize",
+                        serde_json::json!({ "protocolVersion": unsupported }),
+                    )?)
+                    .expect_err(
+                        "proxy initialization must reject a protocol version outside its API",
+                    );
+                let data = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .unwrap_or_default();
+                assert!(
+                    data.contains(&format!("only supports ACP protocol version {selected}")),
+                    "{error:?}"
+                );
+                assert_eq!(negotiated(&compat), selected_kind);
+                assert_eq!(pending_initialize(&compat), None);
+                assert_eq!(compat.active_wire_version(), selected_kind);
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn proxy_initialize_requests_reject_wrong_directions_and_wrapping()
+        -> Result<(), crate::Error> {
+            for mode in [ProtocolMode::v1_proxy(), ProtocolMode::v2_proxy()] {
+                let compat = ProtocolCompat::new(mode);
+                for error in [
+                    compat
+                        .incoming_message(UntypedMessage::new(
+                            "initialize",
+                            serde_json::json!({ "protocolVersion": ProtocolVersion::V2 }),
+                        )?)
+                        .expect_err("proxy initialization must arrive through `_proxy/initialize`"),
+                    compat
+                        .incoming_message(UntypedMessage::new(
+                            "_proxy/successor",
+                            serde_json::json!({
+                                "method": "initialize",
+                                "params": { "protocolVersion": ProtocolVersion::V2 }
+                            }),
+                        )?)
+                        .expect_err("successor traffic must not carry initialization"),
+                    compat
+                        .incoming_message(UntypedMessage::new(
+                            "_proxy/successor",
+                            serde_json::json!({
+                                "method": "_proxy/successor",
+                                "params": {
+                                    "method": "_proxy/initialize",
+                                    "params": { "protocolVersion": ProtocolVersion::V2 }
+                                }
+                            }),
+                        )?)
+                        .expect_err("nested successor traffic must not carry initialization"),
+                    compat
+                        .outgoing_message(
+                            UntypedMessage::new(
+                                "initialize",
+                                serde_json::json!({ "protocolVersion": ProtocolVersion::V2 }),
+                            )?,
+                            RemoteStyle::Predecessor,
+                        )
+                        .expect_err("downstream proxy initialization must use `_proxy/successor`"),
+                    compat
+                        .outgoing_message(
+                            UntypedMessage::new(
+                                "_proxy/initialize",
+                                serde_json::json!({ "protocolVersion": ProtocolVersion::V2 }),
+                            )?,
+                            RemoteStyle::Successor,
+                        )
+                        .expect_err("a proxy must not send `_proxy/initialize` downstream"),
+                ] {
+                    let data = error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.as_str())
+                        .unwrap_or_default();
+                    assert!(data.contains("_proxy/initialize"), "{error:?}");
+                    assert!(data.contains("_proxy/successor"), "{error:?}");
+                }
+                assert_eq!(pending_initialize(&compat), None);
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn outgoing_initialize_rejects_non_object_params() -> Result<(), crate::Error> {
+            for (compat, message, remote_style) in [
+                (
+                    ProtocolCompat::new(ProtocolMode::v2_client()),
+                    UntypedMessage::new("initialize", serde_json::Value::Null)?,
+                    RemoteStyle::Counterpart,
+                ),
+                (
+                    ProtocolCompat::new(ProtocolMode::v2_proxy()),
+                    UntypedMessage::new("initialize", serde_json::Value::Null)?,
+                    RemoteStyle::Successor,
+                ),
+            ] {
+                let error = compat
+                    .outgoing_message(message, remote_style)
+                    .expect_err("initialize params must be an object");
+                let data = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .unwrap_or_default();
+                assert!(data.contains("protocolVersion"), "{error:?}");
+                assert_eq!(pending_initialize(&compat), None);
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn outgoing_initialize_rejects_explicit_successor_wrapping() -> Result<(), crate::Error> {
+            for message in [
+                UntypedMessage::new(
+                    "_proxy/successor",
+                    serde_json::json!({
+                        "method": "initialize",
+                        "params": { "protocolVersion": ProtocolVersion::V1 }
+                    }),
+                )?,
+                UntypedMessage::new(
+                    "_proxy/successor",
+                    serde_json::json!({
+                        "method": "_proxy/successor",
+                        "params": {
+                            "method": "initialize",
+                            "params": { "protocolVersion": ProtocolVersion::V1 }
+                        }
+                    }),
+                )?,
+            ] {
+                let compat = ProtocolCompat::new(ProtocolMode::v2_proxy());
+                let error = compat
+                    .outgoing_message(message, RemoteStyle::Successor)
+                    .expect_err("connection routing must own successor wrapping");
+                let data = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .unwrap_or_default();
+                assert!(data.contains("logical `initialize`"), "{error:?}");
+                assert!(data.contains("_proxy/successor"), "{error:?}");
+                assert_eq!(pending_initialize(&compat), None);
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn proxy_initialize_round_trip_uses_the_selected_protocol_version()
+        -> Result<(), crate::Error> {
+            for (mode, selected, selected_kind) in [
+                (
+                    ProtocolMode::v1_proxy(),
+                    ProtocolVersion::V1,
+                    ProtocolVersionKind::V1,
+                ),
+                (
+                    ProtocolMode::v2_proxy(),
+                    ProtocolVersion::V2,
+                    ProtocolVersionKind::V2,
+                ),
+            ] {
+                let compat = ProtocolCompat::new(mode);
+                let request = compat.incoming_message(UntypedMessage::new(
+                    "_proxy/initialize",
+                    serde_json::json!({ "protocolVersion": selected }),
+                )?)?;
+                assert_eq!(
+                    required_protocol_version_from_value(request.params())?,
+                    selected
+                );
+                assert_eq!(pending_initialize(&compat), Some(selected_kind));
+
+                let response = compat.outgoing_response(
+                    "_proxy/initialize",
+                    Ok(serde_json::json!({ "protocolVersion": selected })),
+                )?;
+                assert_eq!(required_protocol_version_from_value(&response)?, selected);
+                assert_eq!(negotiated(&compat), selected_kind);
+                assert_eq!(pending_initialize(&compat), None);
+                assert_eq!(compat.active_wire_version(), selected_kind);
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn proxy_initialize_response_rejects_the_wrong_version_and_clears_pending_state()
+        -> Result<(), crate::Error> {
+            for (mode, selected, unsupported, selected_kind) in [
+                (
+                    ProtocolMode::v1_proxy(),
+                    ProtocolVersion::V1,
+                    ProtocolVersion::V2,
+                    ProtocolVersionKind::V1,
+                ),
+                (
+                    ProtocolMode::v2_proxy(),
+                    ProtocolVersion::V2,
+                    ProtocolVersion::V1,
+                    ProtocolVersionKind::V2,
+                ),
+            ] {
+                let compat = ProtocolCompat::new(mode);
+                let request = compat.outgoing_message(
+                    UntypedMessage::new(
+                        "initialize",
+                        serde_json::json!({ "protocolVersion": unsupported }),
+                    )?,
+                    RemoteStyle::Successor,
+                )?;
+                assert_eq!(
+                    required_protocol_version_from_value(request.params())?,
+                    selected
+                );
+                assert_eq!(pending_initialize(&compat), Some(selected_kind));
+
+                let error = compat
+                    .incoming_response(
+                        "initialize",
+                        Ok(serde_json::json!({ "protocolVersion": unsupported })),
+                    )
+                    .expect_err("proxy initialization must reject a mismatched response version");
+                let data = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.as_str())
+                    .unwrap_or_default();
+                assert!(
+                    data.contains(&format!(
+                        "required ACP protocol version {selected} but peer negotiated {unsupported}"
+                    )),
+                    "{error:?}"
+                );
+                assert_eq!(negotiated(&compat), selected_kind);
+                assert_eq!(pending_initialize(&compat), None);
+                assert_eq!(compat.active_wire_version(), selected_kind);
+            }
 
             Ok(())
         }
@@ -892,6 +1723,12 @@ mod imp {
         #[should_panic(expected = "cannot merge ACP builders with different API protocol versions")]
         fn merging_different_api_protocol_modes_panics() {
             let _ = ProtocolMode::v1_agent().merge(ProtocolMode::v2_agent());
+        }
+
+        #[test]
+        #[should_panic(expected = "cannot merge standard ACP and proxy ACP builders")]
+        fn merging_standard_and_proxy_protocol_modes_panics() {
+            let _ = ProtocolMode::v1_agent().merge(ProtocolMode::v1_proxy());
         }
     }
 }

@@ -2,6 +2,199 @@
 
 ## [Unreleased]
 
+### Added
+
+- *(unstable-v2)* Add runnable draft-v2 agent and one-shot client examples. The
+  agent implements the complete baseline session lifecycle; the client handles
+  permissions, projects chunk and snapshot updates by message ID, and waits for
+  the matching idle state. Add a compiled cookbook recipe and mdbook quickstart
+  for the same lifecycle.
+- *(unstable-v2)* Add `Proxy::protocol_router` and `ProxyProtocolRouter` to
+  compose strict v1 and v2 proxy implementations behind one connection.
+  Routing requires the exact version selected by the conductor and preserves
+  the complete initial transport frame.
+- *(unstable)* Expose programmatic tool-call names through the
+  `unstable_tool_call_name` feature.
+- *(unstable)* Expose v1 and draft-v2 plan operations through the
+  `unstable_plan_operations` feature.
+- *(unstable-v2)* Add high-level protocol v2 session builders and handles with
+  independent prompt-acceptance requests, create, resume, and feature-gated
+  fork setup responses, cloneable command handles, configuration, close, and
+  session-wide cancellation. `Client.v2()` and `Agent.v2()` callbacks receive
+  a `V2ConnectionTo` whose unversioned `build_session*`, `resume_session*`, and
+  feature-gated `fork_session*` methods expose only the v2 lifecycle. Resume
+  and fork return `V2ResumeSessionBuilder` and `V2ForkSessionBuilder`, so their
+  requests are not published until `start_session` or
+  `on_proxy_session_start` is called. Session updates and interactive requests
+  remain on typed connection handlers. With `unstable_mcp_over_acp`, all
+  available session builders support native per-session MCP attachment while
+  preserving independent response consumption. MCP routes are installed and
+  runners begin executing before the setup request is published; successful
+  attachments remain active for the connection lifetime while setup failures,
+  including cancellation error responses, clean up pending state. The
+  builders' `on_proxy_session_start` helpers forward the complete setup
+  response and cancellation, install routing before later inbound traffic, and
+  then spawn user work with the `OpenedV2Session`. New and fork builders use
+  the response session ID for the installed route and returned command handle;
+  resume routing is ready before request publication so replay can precede the
+  response as required by the protocol.
+- *(unstable-v2)* Add `Proxy::v2()` as the draft-v2-only proxy builder while
+  keeping `Proxy::builder()` on stable v1. With `unstable_mcp_over_acp`,
+  `Proxy.v2().with_mcp_server(...)` injects a connection-scoped MCP server
+  declaration into v2 new, resume, and feature-gated fork setup requests while
+  preserving unrelated fields. Version-neutral routing infrastructure can
+  continue to use `Builder::without_acp_version_guard` when it owns raw
+  version selection and validation.
+- *(unstable-v2)* Expose protocol-neutral dynamic handler registration on
+  `V2ConnectionTo`.
+- *(unstable-v2)* Add `ConnectionTo::spawn_connection_with_context` for raw
+  parents that need the context selected by a child builder.
+  `V2ConnectionTo::spawn_connection` also returns that natural typed context.
+  The existing `ConnectionTo::spawn_connection::<Role>` API remains
+  source-compatible and returns a raw `ConnectionTo`, including when the v2
+  child builder's callbacks receive `V2ConnectionTo`.
+- *(unstable-v2)* Add a version-correct
+  `schema::v2::InitializeProxyRequest` for `_proxy/initialize`. Proxy
+  forwarding now preserves same-version raw initialize fields and raw session
+  creation fields instead of interpreting v2 messages as permissive v1
+  payloads. Add the low-level
+  `Builder::without_acp_version_guard` escape hatch for routing infrastructure
+  that performs its own raw version selection, plus
+  `Builder::with_v2_protocol_guard` for raw-context links after v2 is selected.
+- *(unstable)* Add typed v1 and draft-v2 JSON-RPC routing for configurable LLM
+  provider methods behind `unstable_llm_providers`.
+
+### Fixed
+
+- Preserve stable v1 `NewSessionResponse::config_options` on `ActiveSession`,
+  expose them through `ActiveSession::config_options`, and include them in
+  reconstructed and proxied session responses.
+  ([#301](https://github.com/agentclientprotocol/rust-sdk/issues/301))
+- *(unstable-v2)* Require native v2 client and agent connections to complete
+  their single initialization handshake before sending or accepting other
+  protocol traffic. Reject initialization in the wrong direction and reject
+  reinitialization after a successful handshake while allowing retries after an
+  initialization error. Protocol-level request cancellation remains available
+  while initialization is in progress.
+- *(unstable-v2)* Preserve unknown initialize fields when the protocol router
+  hands a same-version connection to its selected implementation.
+- *(unstable-v2)* Do not retain unhandled v2 session messages for a dynamic v1
+  session route that will never be installed.
+- Register framework-owned ordered response handling before outbound requests
+  become visible to the peer, preventing fast responses from overtaking session
+  routing or proxy forwarding.
+- Allow the portable protocol engine and transport abstractions to build for
+  the `wasm32-wasip1` and `wasm32-wasip2` targets. The native process-backed
+  `AcpAgent`, thread-backed `Stdio`, and associated `LineDirection` type are not
+  exposed on these targets. This crate does not provide a WASI runtime adapter;
+  embedders can supply transport through `Channel`, `Lines`, or
+  `futures::io`-compatible `ByteStreams`.
+  ([#262](https://github.com/agentclientprotocol/rust-sdk/issues/262))
+
+## [2.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/v1.3.0...v2.0.0) - 2026-07-23
+
+Version 2.0 keeps the stable ACP v1 wire schema unchanged while making coordinated breaking
+changes to the Rust SDK APIs and low-level transport boundary.
+
+### Breaking changes
+
+- `Channel` now carries batch-aware `TransportFrame` values, and custom `Channel` or `ConnectTo`
+  relays must preserve frames rather than forwarding individual messages. `Lines` and
+  `ByteStreams` fields are private; construct those adapters with `new`.
+  ([#275](https://github.com/agentclientprotocol/rust-sdk/pull/275),
+  [#280](https://github.com/agentclientprotocol/rust-sdk/pull/280))
+- JSON-RPC APIs now reflect protocol roles: notifications are never answered,
+  `ResponseRouter` uses `route*` methods, typed request IDs are borrowed, and
+  `TypeNotification` is role-independent. ([#272](https://github.com/agentclientprotocol/rust-sdk/pull/272),
+  [#277](https://github.com/agentclientprotocol/rust-sdk/pull/277))
+- Handler and routing APIs now use explicit ownership and terminology:
+  `DynamicHandlerGuard` replaces cloneable registrations, background tasks use `with_runner`,
+  combined matchers use `if_dispatch*`, and obsolete low-level helpers have been removed.
+  ([#277](https://github.com/agentclientprotocol/rust-sdk/pull/277),
+  [#280](https://github.com/agentclientprotocol/rust-sdk/pull/280),
+  [#283](https://github.com/agentclientprotocol/rust-sdk/pull/283))
+- MCP-over-ACP now uses the feature-gated schema-native `McpServer::Acp`, `mcp/connect`,
+  `mcp/message`, and request/response `mcp/disconnect` types. The SDK-local wire types,
+  `acp:` HTTP declarations, and legacy accessors are removed; MCP and session accessors now
+  borrow typed identifiers and connection state. ([#281](https://github.com/agentclientprotocol/rust-sdk/pull/281))
+- `AcpAgent` now uses `AcpAgentConfig`, represents JSON environment variables as an object, and
+  no longer provides the deprecated Zed constructors or the Gemini convenience constructor.
+  ([#276](https://github.com/agentclientprotocol/rust-sdk/pull/276),
+  [#280](https://github.com/agentclientprotocol/rust-sdk/pull/280))
+- Response callbacks that select ordered consumption before a response is routed during its
+  original dispatch now finish before later inbound messages are dispatched. Already-routed
+  responses and locally delivered failures do not add this barrier. Framework session setup is
+  ordered, while user session work remains concurrent. An ordered callback must not await later
+  inbound traffic on the same connection.
+  ([#282](https://github.com/agentclientprotocol/rust-sdk/pull/282))
+
+See the [2.0 migration guide] for exact API replacements and migration examples.
+
+### Added
+
+- Accept incoming JSON-RPC batches on stable v1 and draft v2 connections, process entries
+  independently, and group replies into one response array. Typed requests and notifications
+  are still sent individually. ([#271](https://github.com/agentclientprotocol/rust-sdk/pull/271),
+  [#275](https://github.com/agentclientprotocol/rust-sdk/pull/275))
+- Add `SentRequest::map` for transforming a response with one-shot closures without requiring the
+  mapped output to implement `JsonRpcResponse`. Values consumed with `block_task` may carry
+  non-`'static` lifetimes; callback-style consumption remains `'static`.
+  ([#278](https://github.com/agentclientprotocol/rust-sdk/pull/278))
+
+### Changed
+
+- Update `agent-client-protocol-schema` to 1.5.0. The stable v1 wire schema is unchanged; the
+  opt-in draft v2 API gains semantic newtypes, revised diff and terminal types, and generic
+  fallible conversions. ([#273](https://github.com/agentclientprotocol/rust-sdk/pull/273))
+
+### Fixed
+
+- Install framework-owned session and proxy routes before later messages, route response-handler
+  failures to the pending local request, and prevent handlers from emitting a second response
+  after already responding. ([#280](https://github.com/agentclientprotocol/rust-sdk/pull/280),
+  [#282](https://github.com/agentclientprotocol/rust-sdk/pull/282))
+- Preserve batch boundaries across adapters, routers, and tracing; retain invalid call entries
+  without aborting relays; do not reply to malformed response-shaped input; and complete dropped
+  batched responders so sibling replies can flush.
+  ([#275](https://github.com/agentclientprotocol/rust-sdk/pull/275),
+  [#280](https://github.com/agentclientprotocol/rust-sdk/pull/280))
+- During protocol negotiation, ignore response-only traffic before initialization, preserve
+  response siblings in mixed initialization batches, flush initialization rejections before
+  closing, and drop unused protocol probes before falling back to v1.
+  ([#280](https://github.com/agentclientprotocol/rust-sdk/pull/280),
+  [#285](https://github.com/agentclientprotocol/rust-sdk/pull/285))
+- Preserve `MatchDispatchFrom` retry state across chained matchers.
+  ([#274](https://github.com/agentclientprotocol/rust-sdk/pull/274))
+
+[2.0 migration guide]: https://agentclientprotocol.github.io/rust-sdk/migration_v2.0.html
+
+## [1.3.0](https://github.com/agentclientprotocol/rust-sdk/compare/v1.2.0...v1.3.0) - 2026-07-20
+
+### Added
+
+- *(unstable-v2)* Add routers for supporting both v1 and v2 at once ([#253](https://github.com/agentclientprotocol/rust-sdk/pull/253))
+
+### Fixed
+
+- *(acp)* preserve builder auto traits for on_close ([#269](https://github.com/agentclientprotocol/rust-sdk/pull/269))
+- *(acp)* Handle  incoming EOF correctly ([#261](https://github.com/agentclientprotocol/rust-sdk/pull/261))
+- *(acp)* Bound stderr capture memory ([#255](https://github.com/agentclientprotocol/rust-sdk/pull/255))
+- kill the agent's whole process group when ChildGuard drops ([#251](https://github.com/agentclientprotocol/rust-sdk/pull/251))
+- *(unstable-v2)* Require matching v2 protocol negotiation ([#252](https://github.com/agentclientprotocol/rust-sdk/pull/252))
+
+## [1.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/v1.1.0...v1.2.0) - 2026-07-07
+
+### Added
+
+- *(acp)* add constructors for renamed adapters ([#247](https://github.com/agentclientprotocol/rust-sdk/pull/247))
+
+## [1.1.0](https://github.com/agentclientprotocol/rust-sdk/compare/v1.0.1...v1.1.0) - 2026-07-06
+
+### Added
+
+- *(deps)* bump schema to 1.4.0 ([#243](https://github.com/agentclientprotocol/rust-sdk/pull/243))
+- *(acp)* Make request cancellation stable ([#242](https://github.com/agentclientprotocol/rust-sdk/pull/242))
+
 ## [1.0.1](https://github.com/agentclientprotocol/rust-sdk/compare/v1.0.0...v1.0.1) - 2026-06-29
 
 ### Fixed

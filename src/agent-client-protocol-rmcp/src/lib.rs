@@ -3,15 +3,24 @@
 //! This crate provides integration between [rmcp](https://docs.rs/rmcp) MCP servers
 //! and the Agent Client Protocol MCP server framework.
 //!
+//! Building or directly serving a standalone MCP server requires no unstable
+//! ACP feature. Enable `unstable_mcp_over_acp` when attaching the server to an
+//! ACP connection with `with_mcp_server`.
+//!
 //! ## Usage
 //!
 //! Build an MCP server with tools using the extension trait:
 //!
-//! ```ignore
-//! use agent_client_protocol::mcp_server::McpServer;
+//! ```no_run
+//! use agent_client_protocol::{ConnectTo, mcp_server::McpServer, role::mcp};
 //! use agent_client_protocol_rmcp::McpServerExt;
 //!
-//! let server = McpServer::builder("my-tools").build();
+//! # async fn serve(
+//! #     client_transport: impl ConnectTo<mcp::Server>,
+//! # ) -> agent_client_protocol::Result<()> {
+//! let server = McpServer::<mcp::Client>::builder("my-tools").build();
+//! server.connect_to(client_transport).await
+//! # }
 //! ```
 //!
 //! Or create an MCP server from an rmcp service:
@@ -22,10 +31,11 @@
 //!
 //! let server = McpServer::from_rmcp("my-server", MyRmcpService::new);
 //!
-//! // Use as a handler
+//! // With `unstable_mcp_over_acp`, attach it to a proxy and connect the proxy
+//! // to its transport.
 //! Proxy.builder()
-//!     .with_handler(server)
-//!     .serve(client)
+//!     .with_mcp_server(server)
+//!     .connect_to(transport)
 //!     .await?;
 //! ```
 
@@ -42,7 +52,7 @@ pub use agent_client_protocol::mcp_server::{EnabledTools, McpTool};
 pub use agent_client_protocol::{tool_fn, tool_fn_mut};
 pub use builder::McpServerBuilder;
 
-/// Extension constructors for ACP MCP servers backed by `rmcp`.
+/// Extension constructors for MCP servers backed by `rmcp`.
 pub trait McpServerExt<Counterpart: Role> {
     /// Create an MCP server builder for defining tools in Rust code.
     fn builder(name: impl ToString) -> McpServerBuilder<Counterpart, NullRun> {
@@ -144,5 +154,17 @@ where
 
         (bytes_to_acp, bytes_to_rmcp).try_join().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::{mcp_server::McpServer, role};
+
+    use crate::McpServerExt as _;
+
+    #[test]
+    fn builds_standalone_server_without_acp_transport_feature() {
+        let _server: McpServer<role::mcp::Client, _> = McpServer::builder("standalone").build();
     }
 }

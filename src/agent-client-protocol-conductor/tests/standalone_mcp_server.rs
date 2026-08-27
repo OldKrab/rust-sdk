@@ -1,7 +1,7 @@
 //! Tests for running McpServer as a standalone MCP server (not part of ACP).
 //!
 //! These tests verify that `McpServer` can be used directly with MCP clients
-//! via the `Component<McpServerToClient>` implementation.
+//! via its `ConnectTo<role::mcp::Client>` implementation.
 
 use agent_client_protocol::{
     ByteStreams, ConnectTo, RunWithConnectionTo, mcp_server::McpServer, role::mcp, util::run_until,
@@ -38,7 +38,12 @@ fn create_test_server() -> McpServer<mcp::Client, impl RunWithConnectionTo<mcp::
         .tool_fn(
             "echo",
             "Echo a message back",
-            async |input: EchoInput, _cx| Ok(format!("Echo: {}", input.message)),
+            async |input: EchoInput, cx| {
+                assert!(cx.context().is_standalone());
+                assert_eq!(cx.server_id(), None);
+                assert_eq!(cx.connection_id(), None);
+                Ok(format!("Echo: {}", input.message))
+            },
             agent_client_protocol::tool_fn!(),
         )
         .tool_fn(
@@ -145,7 +150,7 @@ async fn test_standalone_server_call_echo_tool() -> Result<(), agent_client_prot
             let text = result
                 .content
                 .first()
-                .and_then(|c| c.raw.as_text())
+                .and_then(|c| c.as_text())
                 .map(|t| t.text.as_str())
                 .expect("Expected text content");
 
@@ -197,7 +202,7 @@ async fn test_standalone_server_call_add_tool() -> Result<(), agent_client_proto
 
             // Structured output should have the result
             let content = result.content.first().expect("Expected content");
-            let text = content.raw.as_text().expect("Expected text content");
+            let text = content.as_text().expect("Expected text content");
             assert!(
                 text.text.contains('8') || text.text.contains("result"),
                 "Expected result to contain 8, got: {}",

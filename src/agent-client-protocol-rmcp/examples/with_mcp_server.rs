@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example with_mcp_server
+//! cargo run --example with_mcp_server --features unstable_mcp_over_acp
 //! ```
 
 use agent_client_protocol::{Proxy, mcp_server::McpServer};
@@ -56,13 +56,14 @@ impl ExampleMcpServer {
         &self,
         Parameters(params): Parameters<EchoParams>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Echo: {}",
             params.message
         ))]))
     }
 }
 
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for ExampleMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -87,13 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_server = McpServer::from_rmcp("example", ExampleMcpServer::new);
 
     // Set up the proxy connection with our MCP server
-    // ProxyToConductor already has proxy behavior built into its default_message_handler
     Proxy
         .builder()
         .name("mcp-server-proxy")
         // Register the MCP server as a handler
         .with_mcp_server(mcp_server)
-        // Start serving
+        // Connect the proxy to the conductor over stdio
         .connect_to(agent_client_protocol::ByteStreams::new(
             tokio::io::stdout().compat_write(),
             tokio::io::stdin().compat(),

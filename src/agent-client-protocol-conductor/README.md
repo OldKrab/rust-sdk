@@ -28,23 +28,12 @@ The conductor:
 3. Presents as a single agent on stdin/stdout
 4. Manages the lifecycle of all processes
 
-### MCP Bridge Mode
-
-Connect stdio to a TCP-based MCP server:
-
-```bash
-# Bridge stdio to MCP server on localhost:8080
-agent-client-protocol-conductor mcp 8080
-```
-
-This allows stdio-based tools to communicate with TCP MCP servers.
-
 ## How It Works
 
 **Component Communication:**
 
 - Editor talks to conductor via stdio
-- Conductor uses `_proxy/successor/*` protocol extensions to route messages
+- Conductor uses the `_proxy/successor` envelope to route messages
 - Each proxy can intercept, transform, or forward messages
 - Final agent receives standard ACP messages
 
@@ -58,6 +47,9 @@ This allows stdio-based tools to communicate with TCP MCP servers.
 
 ```bash
 cargo build --release -p agent-client-protocol-conductor
+
+# Include draft ACP v2 proxy initialization
+cargo build --release -p agent-client-protocol-conductor --features unstable_protocol_v2
 ```
 
 Binary will be at `target/release/agent-client-protocol-conductor`.
@@ -65,7 +57,7 @@ Binary will be at `target/release/agent-client-protocol-conductor`.
 ## Related Crates
 
 - **[agent-client-protocol](../agent-client-protocol/)** — Core ACP protocol types and traits
-- **[agent-client-protocol-tokio](../agent-client-protocol-tokio/)** — Tokio utilities for process spawning
+- **[agent-client-protocol-polyfill](../agent-client-protocol-polyfill/)** — Compatibility proxies, including adapting MCP-over-ACP to HTTP
 - **[agent-client-protocol-trace-viewer](../agent-client-protocol-trace-viewer/)** — Interactive trace visualization
 
 ## License

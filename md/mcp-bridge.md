@@ -1,380 +1,146 @@
-# MCP Bridge: Proxying MCP over ACP
+# MCP-over-ACP Compatibility Bridge
 
-The **MCP Bridge** enables agents without native MCP-over-ACP support to work with proxy components that provide MCP servers using ACP transport (`acp:$UUID`).
+`agent-client-protocol-polyfill::mcp_over_acp::McpOverAcpPolyfill` adapts the
+native ACP MCP transport for a final agent that accepts HTTP MCP
+servers. MCP adaptation is explicit and is not built into the conductor.
 
-## Problem Statement
+The component-facing side of the bridge always uses the opt-in native protocol:
 
-Proxy components may want to expose MCP servers to agents using ACP as the transport layer. This allows:
+- Servers are declared as `McpServer::Acp` with a `serverId`.
+- Connections use `mcp/connect`, `mcp/message`, and `mcp/disconnect`.
+- `mcp/disconnect` is a request with a response.
 
-- Dynamic MCP server registration during session creation
-- Proxies to correlate MCP tool calls with specific ACP sessions
-- Unified protocol handling (everything flows through ACP messages)
+The SDK-local underscore-prefixed method family and HTTP declarations with a
+special URL scheme have been retired. The polyfill now translates native
+declarations to real localhost HTTP URLs only at
+the compatibility boundary.
 
-However, many agents only support traditional MCP transports (stdio, SSE). The conductor bridges this gap by:
+Native MCP-over-ACP requires the core SDK's `unstable_mcp_over_acp` feature. The
+polyfill enables that feature on its core dependency, so applications using the
+polyfill receive it through Cargo feature unification.
 
-1. Accepting `acp:$UUID` URLs in `session/new` requests
-2. Transforming them into stdio-based MCP servers the agent can connect to
-3. Routing MCP messages between the agent (stdio) and proxies (ACP `_mcp/*` messages)
+The polyfill supports stable protocol v1 by default. To place it in a draft-v2
+conductor chain, enable `unstable_protocol_v2` on both the conductor and
+polyfill dependencies:
 
-## High-Level Architecture
-
-```mermaid
-flowchart LR
-    Proxy[Proxy Component]
-    Conductor[Conductor]
-    Agent[Agent Process]
-    Bridge[MCP Bridge Process]
-
-    Proxy -->|session/new with acp: URL| Conductor
-    Conductor -->|session/new with stdio| Agent
-    Agent <-->|stdio| Bridge
-    Bridge <-->|TCP| Conductor
-    Conductor <-->|_mcp/* messages| Proxy
+```toml
+agent-client-protocol-conductor = { version = "...", features = ["unstable_protocol_v2"] }
+agent-client-protocol-polyfill = { version = "...", features = ["unstable_protocol_v2"] }
 ```
 
-**Key decision**: Use stdio + TCP bridge instead of direct stdio to agent, because:
+The feature makes this concrete compatibility proxy recognize v2
+initialization, capability, session setup, and `mcp/*` wire types. It does not
+change the core attachment API. `Proxy.v2().with_mcp_server(...)` provides
+connection-global attachment. `V2SessionBuilder::with_mcp_server(...)` and
+`V2ResumeSessionBuilder::with_mcp_server(...)` provide per-session attachment
+for new and resumed sessions respectively. With `unstable_session_fork`,
+`V2ForkSessionBuilder::with_mcp_server(...)` provides per-session fork
+attachment. The polyfill adapts their native declarations when the final agent
+supports only HTTP MCP.
 
-- Preserves agent isolation (agent only sees stdio)
-- Enables connection multiplexing (multiple bridges to one conductor)
-- Simplifies lifecycle management (bridge exits when agent closes stdio)
+## Placement
 
-## Session Initialization Flow
+Insert the polyfill immediately before the final agent that lacks native
+MCP-over-ACP support:
 
-The conductor transforms MCP servers during session creation and correlates them with session IDs.
+```rust,ignore
+use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
+use agent_client_protocol_polyfill::mcp_over_acp::McpOverAcpPolyfill;
 
-```mermaid
-sequenceDiagram
-    participant Proxy
-    participant Conductor
-    participant Listener as MCP Bridge<br/>Listener Actor
-    participant Agent
+let components = ProxiesAndAgent::new(agent)
+    .proxy(application_proxy)
+    .proxy(McpOverAcpPolyfill::http());
 
-    Note over Proxy: Wants to provide MCP server<br/>with session-specific context
-
-    Proxy->>Conductor: session/new {<br/>  mcp_servers: [{<br/>    name: "research-tools",<br/>    url: "acp:uuid-123"<br/>  }]<br/>}
-
-    Note over Conductor: Detects acp: transport<br/>Agent lacks mcpCapabilities.acp
-
-    Conductor->>Conductor: Bind TCP listener on port 54321
-
-    Conductor->>Listener: Spawn MCP Bridge Listener<br/>(acp_url: "acp:uuid-123")
-
-    Note over Listener: Listening on TCP port 54321<br/>Waiting for session_id
-
-    Conductor->>Agent: session/new {<br/>  mcp_servers: [{<br/>    name: "research-tools",<br/>    command: "conductor",<br/>    args: ["mcp", "54321"]<br/>  }]<br/>}
-
-    Agent-->>Conductor: session/new response {<br/>  session_id: "sess-abc"<br/>}
-
-    Note over Conductor: Extract session_id from response
-
-    Conductor->>Listener: Send session_id: "sess-abc"<br/>(via oneshot channel)
-
-    Note over Listener: Now has session_id<br/>Ready to accept connections
-
-    Conductor-->>Proxy: session/new response {<br/>  session_id: "sess-abc"<br/>}
-
-    Note over Agent: Later: spawns MCP bridge process
-
-    Agent->>Bridge: spawn process:<br/>conductor mcp 54321
-
-    Bridge->>Listener: TCP connect to localhost:54321
-
-    Note over Listener: Connection arrives<br/>Session ID already known
-
-    Listener->>Conductor: McpConnectionReceived {<br/>  acp_url: "acp:uuid-123",<br/>  session_id: "sess-abc"<br/>}
-
-    Conductor->>Proxy: _mcp/connect {<br/>  acp_url: "acp:uuid-123",<br/>  session_id: "sess-abc"<br/>}
-
-    Proxy-->>Conductor: _mcp/connect response {<br/>  connection_id: "conn-xyz"<br/>}
-
-    Note over Proxy: Can correlate connection<br/>with session context
-
-    Conductor-->>Listener: connection_id: "conn-xyz"
-
-    Note over Listener,Bridge: Bridge now active<br/>Routes MCP <-> ACP messages
+ConductorImpl::new_agent("conductor", components)
+    .run(upstream_transport)
+    .await?;
 ```
 
-### Key Decisions
+The application proxy can attach a high-level
+`agent_client_protocol::mcp_server::McpServer`. The SDK advertises it in session
+setup requests as `McpServer::Acp`; callers do not need to construct a transport
+placeholder themselves. In v2, `Proxy.v2().with_mcp_server(...)` provides
+connection-global attachment. `V2SessionBuilder::with_mcp_server(...)` and
+`V2ResumeSessionBuilder::with_mcp_server(...)` provide per-session attachment
+for new and resumed sessions respectively. With `unstable_session_fork`,
+`V2ForkSessionBuilder::with_mcp_server(...)` provides per-session fork
+attachment. The polyfill translates those native declarations at the final
+compatibility boundary.
 
-**Why spawn TCP listener before getting session_id (during request, not response)?**
+During initialization, the polyfill forwards the request to its successor. When
+the successor advertises HTTP MCP support, the polyfill advertises native ACP
+MCP support in the response seen upstream:
 
-- Agent may spawn bridge process immediately after receiving `session/new` response
-- If listener doesn't exist yet, bridge connection fails with "connection refused"
-- Spawning during request ensures TCP port is ready before agent receives response
-- Session_id delivered asynchronously via oneshot channel once response arrives
+- v1 sets `agentCapabilities.mcpCapabilities.acp` to `true`.
+- v2 adds the `capabilities.session.mcp.acp` marker.
 
-**Why send session_id to listener before forwarding response?**
+In this chain position that capability means the chain can consume native
+MCP-over-ACP declarations through the adapter; it does not imply that the final
+agent implements the transport itself.
 
-- Ensures session_id is available before agent spawns bridge process
-- Eliminates race condition where TCP connection arrives before session_id known
-- Listener blocks on receiving session_id, guaranteeing it's available when needed
+If the successor already advertises native ACP MCP support, the polyfill leaves
+the capability, declarations, and `mcp/message` traffic unchanged. If it
+supports neither native nor HTTP MCP, the polyfill does not advertise ACP MCP
+support and rejects any native declaration that is nevertheless supplied.
 
-**Why include session_id in `_mcp/connect`?**
+## Transformation
 
-- Proxies need to correlate MCP connections with ACP sessions
-- Example: Research proxy remembers session context (current task, preferences)
-- Without session_id, proxy has no way to associate connection with session state
+For each schema-selected `McpServer::Acp` entry in a session setup request, the
+polyfill:
 
-**Why use oneshot channel for session_id delivery?**
+1. Creates or reuses a connection-scoped localhost bridge endpoint for the
+   `serverId` and replaces the declaration with the HTTP transport for the
+   final agent.
+2. Retains the native `serverId` so connections can be routed back to the
+   component that provided the server.
+3. Opens the endpoint's native connection by sending `mcp/connect` with that
+   server ID toward the provider.
+4. Relays requests and notifications through `mcp/message`, using the returned
+   `connectionId` for that active MCP connection.
+5. Sends an `mcp/disconnect` request when the local transport closes and removes
+   the connection from the bridge.
 
-- Listener spawned during request handling (before response available)
-- Response comes asynchronously from agent
-- Oneshot channel delivers session_id exactly once when response arrives
-- Clean separation: listener setup (during request) vs session_id delivery (during response)
+Enable the polyfill crate's `unstable_session_fork` feature when adapting fork
+requests. Stable v1 setup includes `session/new`, `session/load`, and
+`session/resume`; draft v2 includes `session/new` and `session/resume`. Both
+versions include `session/fork` when `unstable_session_fork` is enabled.
 
-## Connection Lifecycle
+Declarations using another transport are left unchanged, including extension
+transports represented by v2's `McpServer::Other`.
 
-Once the MCP connection is established, the bridge routes messages bidirectionally:
+Endpoints are cached by `serverId` across session setup requests on the ACP
+connection. The output declaration is rebuilt for each occurrence, preserving
+that occurrence's `name`, `_meta`, and other unmodified extension fields even
+when its endpoint is reused.
 
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant Bridge as MCP Bridge<br/>Process
-    participant Listener as Bridge Listener<br/>Actor
-    participant Conductor
-    participant Proxy
+The native wire envelopes are documented in the [SDK Protocol
+Reference](./protocol.md#native-mcp-over-acp).
 
-    Note over Agent,Proxy: Connection established (connection_id: "conn-xyz")
+## HTTP Mode
 
-    Agent->>Bridge: MCP tools/list request<br/>(stdio JSON-RPC)
+`McpOverAcpPolyfill::http()` is the default compatibility shape. It replaces
+the native declaration with an HTTP MCP URL at `http://127.0.0.1:PORT`. The
+embedded server accepts MCP POST requests and an SSE GET stream at `/`, retaining
+JSON-RPC batch frames and correlating each POST with its response.
 
-    Bridge->>Listener: JSON-RPC over TCP
-
-    Listener->>Conductor: Raw JSON-RPC message
-
-    Conductor->>Proxy: _mcp/request {<br/>  connection_id: "conn-xyz",<br/>  method: "tools/list",<br/>  params: {...}<br/>}
-
-    Note over Proxy: Has connection_id -> session_id mapping<br/>Can use session context
-
-    Proxy-->>Conductor: _mcp/request response {<br/>  tools: [...]<br/>}
-
-    Conductor-->>Listener: JSON-RPC response
-
-    Listener-->>Bridge: JSON-RPC over TCP
-
-    Bridge-->>Agent: MCP response<br/>(stdio JSON-RPC)
-
-    Note over Agent: Agent disconnects
-
-    Agent->>Bridge: Close stdio
-
-    Bridge->>Listener: Close TCP connection
-
-    Listener->>Conductor: McpConnectionDisconnected {<br/>  connection_id: "conn-xyz"<br/>}
-
-    Conductor->>Proxy: _mcp/disconnect {<br/>  connection_id: "conn-xyz"<br/>}
-
-    Note over Proxy: Clean up session state
+```rust,ignore
+let bridge = McpOverAcpPolyfill::http();
 ```
 
-### Key Decisions
-
-**Why route through conductor instead of direct bridge-to-proxy?**
-
-- Maintains consistent message ordering through central conductor queue
-- Preserves conductor as sole message router
-- Simplifies error handling and lifecycle management
-
-**Why use connection_id instead of session_id in `_mcp/*` messages?**
-
-- One session can have multiple MCP connections (multiple servers)
-- Connection_id uniquely identifies the bridge instance
-- Proxies maintain `connection_id -> session_id` mapping internally
-
-**Why send disconnect notification?**
-
-- Allows proxies to clean up session-specific state
-- Enables resource cleanup (close files, release locks, etc.)
-- Provides explicit lifecycle boundary
-
-## Race Condition Handling
-
-The session_id delivery mechanism prevents a race condition:
-
-```mermaid
-sequenceDiagram
-    participant Conductor
-    participant Listener as MCP Bridge Listener
-    participant Agent
-    participant Bridge as MCP Bridge Process
-
-    Note over Conductor: Without oneshot channel coordination
-
-    Conductor->>Listener: Spawn (no session_id yet)
-
-    Conductor->>Agent: session/new request
-
-    Note over Agent: Fast agent responds immediately
-
-    Agent->>Bridge: Spawn bridge process
-
-    Bridge->>Listener: TCP connect
-
-    Note over Listener: ❌ No session_id available yet!<br/>Can't send McpConnectionReceived
-
-    Agent-->>Conductor: session/new response {<br/>  session_id: "sess-abc"<br/>}
-
-    Note over Conductor: Too late - connection already waiting
-
-    rect rgb(200, 50, 50)
-        Note over Listener,Bridge: Race condition:<br/>Connection arrived before session_id
-    end
-```
-
-**Solution**: Listener blocks on oneshot channel:
-
-```mermaid
-sequenceDiagram
-    participant Conductor
-    participant Listener as MCP Bridge Listener
-    participant Agent
-    participant Bridge as MCP Bridge Process
-
-    Conductor->>Listener: Spawn with oneshot receiver
-
-    Note over Listener: Listening on TCP<br/>Waiting for session_id via oneshot
-
-    Conductor->>Agent: session/new request
-
-    Agent->>Bridge: Spawn bridge process
-
-    Bridge->>Listener: TCP connect
-
-    Note over Listener: Connection accepted<br/>⏸️ BLOCKS waiting for session_id
-
-    Agent-->>Conductor: session/new response {<br/>  session_id: "sess-abc"<br/>}
-
-    Conductor->>Listener: Send "sess-abc" via oneshot
-
-    Note over Listener: ✅ Session ID received<br/>Unblocks with connection + session_id
-
-    Listener->>Conductor: McpConnectionReceived {<br/>  acp_url: "acp:uuid-123",<br/>  session_id: "sess-abc"<br/>}
-
-    rect rgb(50, 200, 50)
-        Note over Listener,Bridge: No race condition:<br/>session_id always available
-    end
-```
-
-**Key decision**: Block connection acceptance on session_id availability
-
-- Listener accepts TCP connection immediately (agent won't wait)
-- But blocks sending `McpConnectionReceived` until session_id arrives
-- Guarantees session_id is always available when creating `_mcp/connect` request
-- Simple implementation: `oneshot_rx.await?` before sending message
-
-## Multiple MCP Servers
-
-A single session can register multiple MCP servers:
-
-```mermaid
-flowchart TB
-    Proxy[Proxy]
-    Conductor[Conductor]
-    Agent[Agent]
-
-    Listener1[Listener: acp:uuid-1<br/>Port 54321]
-    Listener2[Listener: acp:uuid-2<br/>Port 54322]
-
-    Bridge1[Bridge: conductor mcp 54321]
-    Bridge2[Bridge: conductor mcp 54322]
-
-    Proxy -->|session/new with 2 servers| Conductor
-    Conductor -->|session_id: sess-abc| Listener1
-    Conductor -->|session_id: sess-abc| Listener2
-    Conductor -->|session/new response| Proxy
-
-    Agent <-->|stdio| Bridge1
-    Agent <-->|stdio| Bridge2
-
-    Bridge1 <-->|TCP| Listener1
-    Bridge2 <-->|TCP| Listener2
-
-    Listener1 -->|_mcp/* messages<br/>conn-1| Conductor
-    Listener2 -->|_mcp/* messages<br/>conn-2| Conductor
-
-    Conductor <-->|Both connections| Proxy
-
-    style Listener1 fill:#e1f5ff
-    style Listener2 fill:#e1f5ff
-```
-
-**Key decisions**:
-
-- Each `acp:` URL gets its own TCP port and listener
-- All listeners for a session receive the same session_id
-- Each connection gets unique connection_id
-- Proxy maintains map: `connection_id -> (session_id, acp_url)`
-
-## Implementation Components
-
-### McpBridgeListeners
-
-- **Purpose**: Manages TCP listeners for all `acp:` URLs
-- **Lifecycle**: Created with conductor, lives for entire conductor lifetime
-- **Responsibilities**:
-  - Detect `acp:` URLs during `session/new`
-  - Spawn TCP listeners on ephemeral ports
-  - Transform MCP server specs to stdio transport
-  - Deliver session_id to listeners via oneshot channels
-
-### McpBridgeListener Actor
-
-- **Purpose**: Accepts TCP connections for a specific `acp:` URL
-- **Lifecycle**: Spawned during `session/new`, lives until conductor exits
-- **Responsibilities**:
-  - Listen on TCP port
-  - Block on oneshot channel to receive session_id
-  - Accept connections and send `McpConnectionReceived` with session_id
-  - Spawn connection actors
-
-### McpBridgeConnectionActor
-
-- **Purpose**: Routes messages for a single MCP connection
-- **Lifecycle**: Spawned when agent connects, exits when agent disconnects
-- **Responsibilities**:
-  - Read JSON-RPC from TCP, forward to conductor
-  - Receive messages from conductor, write to TCP
-  - Send `McpConnectionDisconnected` on close
-
-### MCP Bridge Process (`conductor mcp $PORT`)
-
-- **Purpose**: Bridges agent's stdio to conductor's TCP
-- **Lifecycle**: Spawned by agent, exits when stdio closes
-- **Responsibilities**:
-  - Connect to TCP port on startup
-  - Bidirectional stdio ↔ TCP forwarding
-  - No protocol awareness (just bytes)
-
-## Error Handling
-
-### Agent Disconnects During Session Creation
-
-If agent closes connection before sending `session/new` response:
-
-- Oneshot channel sender drops
-- Listener receives `Err` from oneshot
-- Listener exits gracefully
-- TCP port cleaned up
-
-### Bridge Process Crashes
-
-If bridge process exits unexpectedly:
-
-- TCP connection closes
-- Listener detects disconnect
-- Sends `McpConnectionDisconnected`
-- Proxy cleans up state
-
-### Multiple Connections to Same Listener
-
-Decision: Allow multiple connections per listener (for future flexibility)
-
-- Each connection gets unique connection_id
-- All connections share same session_id
-- Proxy can correlate all connections to session
-
-## Related Documentation
-
-- [Conductor Design](./conductor.md) - Conductor architecture
-- [Protocol Reference](./protocol.md) - ACP message formats
-- [Cookbook rustdoc](https://docs.rs/agent-client-protocol-cookbook) - Patterns for implementing MCP-aware proxies
+The listener is bound only on loopback and uses an ephemeral port. It does not
+implement resumable SSE event IDs.
+
+## Lifecycle and Failure Behavior
+
+Each bridge endpoint receives a unique `connectionId` from `mcp/connect`. The
+polyfill keeps a connection map until the endpoint's transport task closes,
+then removes the entry, sends `mcp/disconnect`, and observes its response.
+Request failures use the corresponding request's error path; notifications are
+never answered with synthetic errors.
+
+A reverse `mcp/message` request for an unknown `connectionId` receives
+`Invalid params`. A reverse notification for an unknown connection is ignored,
+as required for JSON-RPC notifications.
+
+The polyfill does not infer or store ACP session IDs. Association is carried by
+the declared `serverId` and the resulting active `connectionId`.

@@ -1,12 +1,14 @@
+#[cfg(feature = "unstable_protocol_v2")]
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use uuid::Uuid;
 
 use crate::role::Role;
 use crate::{ConnectionTo, Dispatch, HandleDispatchFrom, Handled};
 
-/// Internal dyn-safe wrapper around `HandleMessageAs`
+/// Internal dyn-safe wrapper around [`HandleDispatchFrom`].
 ///
-/// The type parameter `R` is the role's counterpart (who we connect to).
+/// The type parameter is the role's counterpart (who we connect to).
 pub(crate) trait DynHandleDispatchFrom<Counterpart: Role>: Send {
     fn dyn_handle_dispatch_from(
         &mut self,
@@ -37,6 +39,12 @@ impl<Counterpart: Role, H: HandleDispatchFrom<Counterpart>> DynHandleDispatchFro
 pub(crate) enum DynamicHandlerMessage<Counterpart: Role> {
     AddDynamicHandler(Uuid, Box<dyn DynHandleDispatchFrom<Counterpart>>),
     RemoveDynamicHandler(Uuid),
+    /// Marks the end of the registrations queued by an ordered response callback.
+    Barrier,
+    /// Acknowledges after every preceding dynamic-handler message has been
+    /// applied by the incoming protocol actor.
+    #[cfg(feature = "unstable_protocol_v2")]
+    AcknowledgedBarrier(oneshot::Sender<()>),
 }
 
 impl<Counterpart: Role> std::fmt::Debug for DynamicHandlerMessage<Counterpart> {
@@ -50,6 +58,9 @@ impl<Counterpart: Role> std::fmt::Debug for DynamicHandlerMessage<Counterpart> {
             Self::RemoveDynamicHandler(arg0) => {
                 f.debug_tuple("RemoveDynamicHandler").field(arg0).finish()
             }
+            Self::Barrier => f.write_str("Barrier"),
+            #[cfg(feature = "unstable_protocol_v2")]
+            Self::AcknowledgedBarrier(_) => f.write_str("AcknowledgedBarrier"),
         }
     }
 }

@@ -27,6 +27,13 @@ pub(crate) fn is_initialize_request(msg: &RawJsonRpcMessage) -> bool {
     matches!(msg, RawJsonRpcMessage::Request(req) if req.method.as_ref() == "initialize")
 }
 
+pub(crate) fn is_response_only_shape(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error"))
+    })
+}
+
 pub(crate) fn method_for_message(msg: &RawJsonRpcMessage) -> Option<&str> {
     match msg {
         RawJsonRpcMessage::Request(req) => Some(req.method.as_ref()),
@@ -40,7 +47,6 @@ pub(crate) fn is_connection_scoped_protocol_message(msg: &RawJsonRpcMessage) -> 
         || is_cancel_request_message(msg)
 }
 
-#[cfg(feature = "unstable_cancel_request")]
 fn is_cancel_request_message(msg: &RawJsonRpcMessage) -> bool {
     let RawJsonRpcMessage::Notification(notification) = msg else {
         return false;
@@ -55,11 +61,6 @@ fn is_cancel_request_message(msg: &RawJsonRpcMessage) -> bool {
         return false;
     };
     agent_client_protocol::is_cancel_request_notification(&notification)
-}
-
-#[cfg(not(feature = "unstable_cancel_request"))]
-fn is_cancel_request_message(_msg: &RawJsonRpcMessage) -> bool {
-    false
 }
 
 pub(crate) fn session_id_from_params(params: &RawJsonRpcParams) -> Option<String> {
@@ -215,7 +216,7 @@ mod tests {
         assert!(value["params"].get("sessionId").is_none());
     }
 
-    #[cfg(all(feature = "server", feature = "unstable_cancel_request"))]
+    #[cfg(feature = "server")]
     #[test]
     fn successor_wrapped_cancel_request_ignores_session_header() {
         let mut message = RawJsonRpcMessage::notification(

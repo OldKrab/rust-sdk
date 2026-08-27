@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-trace-viewer-v1.3.0...agent-client-protocol-trace-viewer-v2.0.0) - 2026-07-23
+
+### Changed
+
+- Align the version with the coordinated SDK 2.0 release. The trace viewer has no core SDK
+  dependency, and its public API and request/response/notification trace JSON format are
+  unchanged.
+
+## [1.3.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-trace-viewer-v1.2.0...agent-client-protocol-trace-viewer-v1.3.0) - 2026-07-20
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.0.1](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-trace-viewer-v1.0.0...agent-client-protocol-trace-viewer-v1.0.1) - 2026-06-29
 
 ### Other

@@ -28,7 +28,7 @@ pub mod mcp;
 ///
 /// Each role determines:
 /// - Who the counterpart is (via [`Role::Counterpart`])
-/// - How unhandled messages are processed (via `Role::default_message_handler`)
+/// - How unhandled messages are processed (via [`Role::default_handle_dispatch_from`])
 pub trait Role: Debug + Clone + Send + Sync + 'static + Eq + Ord + Hash {
     /// The role that this endpoint connects to.
     ///
@@ -264,7 +264,7 @@ where
 }
 
 /// A dummy role you can use to exchange JSON-RPC messages without any knowledge of the underlying protocol.
-/// Don't sue this.
+/// Prefer a protocol-specific role when one is available.
 #[derive(
     Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -284,15 +284,15 @@ impl Role for UntypedRole {
         RoleId::from_singleton(self)
     }
 
-    async fn default_handle_dispatch_from(
+    fn default_handle_dispatch_from(
         &self,
         message: Dispatch,
         _connection: ConnectionTo<Self>,
-    ) -> Result<Handled<Dispatch>, crate::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, crate::Error>> + Send {
+        std::future::ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 
     fn counterpart(&self) -> Self::Counterpart {

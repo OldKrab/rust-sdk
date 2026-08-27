@@ -233,7 +233,6 @@ macro_rules! impl_jsonrpc_notification_enum {
 ///     CancelRequestNotification => "$/cancel_request",
 /// });
 /// ```
-#[cfg(feature = "unstable_cancel_request")]
 macro_rules! impl_jsonrpc_protocol_level_notification_enum {
     ($enum:ty {
         $( $variant:ident => $method:literal, )*
@@ -310,6 +309,8 @@ macro_rules! impl_jsonrpc_response_enum {
 mod agent_to_client;
 mod client_to_agent;
 mod enum_impls;
+#[cfg(feature = "unstable_mcp_over_acp")]
+mod mcp;
 mod protocol_level;
 mod proxy_protocol;
 #[cfg(feature = "unstable_protocol_v2")]
@@ -324,11 +325,42 @@ pub mod v1 {
 #[cfg(feature = "unstable_protocol_v2")]
 pub mod v2 {
     pub use agent_client_protocol_schema::v2::*;
+
+    /// Initialize request for a protocol-v2 proxy component.
+    ///
+    /// This uses the same `_proxy/initialize` extension method as the stable
+    /// [`super::InitializeProxyRequest`], but preserves the v2 initialize
+    /// request and response schemas.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, crate::JsonRpcRequest)]
+    #[request(
+        method = "_proxy/initialize",
+        response = InitializeResponse,
+        crate = crate
+    )]
+    pub struct InitializeProxyRequest {
+        /// The underlying protocol-v2 initialize request data.
+        #[serde(flatten)]
+        pub initialize: InitializeRequest,
+    }
+
+    impl InitializeProxyRequest {
+        /// Create a proxy initialization request from a normal v2 initialization request.
+        #[must_use]
+        pub fn new(initialize: InitializeRequest) -> Self {
+            Self { initialize }
+        }
+    }
+
+    impl From<InitializeRequest> for InitializeProxyRequest {
+        fn from(initialize: InitializeRequest) -> Self {
+            Self::new(initialize)
+        }
+    }
 }
 
 pub use agent_client_protocol_schema::{
     IntoMaybeUndefined, IntoOption, MaybeUndefined, ProtocolVersion,
 };
 
-// Re-export SDK-local proxy/MCP bridge protocol types flatly.
+// Re-export SDK-local proxy protocol types flatly.
 pub use proxy_protocol::*;

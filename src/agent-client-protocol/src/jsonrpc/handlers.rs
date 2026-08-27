@@ -1,9 +1,13 @@
-use crate::jsonrpc::{HandleDispatchFrom, Handled, IntoHandled, JsonRpcResponse};
+use crate::jsonrpc::{
+    ConnectionContext, HandleDispatchFrom, Handled, IntoHandled, JsonRpcResponse,
+    RawConnectionContext, connection_context,
+};
 
 use crate::role::{HasPeer, Role, handle_incoming_dispatch};
 use crate::{ConnectionTo, Dispatch, JsonRpcNotification, JsonRpcRequest, UntypedMessage};
 // Types re-exported from crate root
 use super::Responder;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::AsyncFnMut;
 
@@ -11,17 +15,9 @@ use std::ops::AsyncFnMut;
 #[derive(Debug)]
 pub struct NullHandler;
 
-impl NullHandler {
-    /// Creates a new null handler.
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 impl Default for NullHandler {
     fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -30,15 +26,15 @@ impl<Counterpart: Role> HandleDispatchFrom<Counterpart> for NullHandler {
         "(null)"
     }
 
-    async fn handle_dispatch_from(
+    fn handle_dispatch_from(
         &mut self,
         message: Dispatch,
         _cx: ConnectionTo<Counterpart>,
-    ) -> Result<Handled<Dispatch>, crate::Error> {
-        Ok(Handled::No {
+    ) -> impl Future<Output = Result<Handled<Dispatch>, crate::Error>> + Send {
+        std::future::ready(Ok(Handled::No {
             message,
             retry: false,
-        })
+        }))
     }
 }
 
@@ -49,16 +45,17 @@ pub struct RequestHandler<
     Req: JsonRpcRequest = UntypedMessage,
     F = (),
     ToFut = (),
+    Context = RawConnectionContext,
 > {
     counterpart: Counterpart,
     peer: Peer,
     handler: F,
     to_future_hack: ToFut,
-    phantom: PhantomData<fn(Req)>,
+    phantom: PhantomData<fn(Req, Context)>,
 }
 
-impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, F, ToFut>
-    RequestHandler<Counterpart, Peer, Req, F, ToFut>
+impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, F, ToFut, Context>
+    RequestHandler<Counterpart, Peer, Req, F, ToFut, Context>
 {
     /// Creates a new request handler
     pub fn new(counterpart: Counterpart, peer: Peer, handler: F, to_future_hack: ToFut) -> Self {
@@ -72,15 +69,16 @@ impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, F, ToFut>
     }
 }
 
-impl<Counterpart: Role, Peer: Role, Req, F, T, ToFut> HandleDispatchFrom<Counterpart>
-    for RequestHandler<Counterpart, Peer, Req, F, ToFut>
+impl<Counterpart: Role, Peer: Role, Req, F, T, ToFut, Context> HandleDispatchFrom<Counterpart>
+    for RequestHandler<Counterpart, Peer, Req, F, ToFut, Context>
 where
     Counterpart: HasPeer<Peer>,
     Req: JsonRpcRequest,
+    Context: ConnectionContext,
     F: AsyncFnMut(
             Req,
             Responder<Req::Response>,
-            ConnectionTo<Counterpart>,
+            Context::Connection<Counterpart>,
         ) -> Result<T, crate::Error>
         + Send,
     T: crate::IntoHandled<(Req, Responder<Req::Response>)>,
@@ -88,7 +86,7 @@ where
             &mut F,
             Req,
             Responder<Req::Response>,
-            ConnectionTo<Counterpart>,
+            Context::Connection<Counterpart>,
         ) -> crate::BoxFuture<'_, Result<T, crate::Error>>
         + Send
         + Sync,
@@ -127,7 +125,7 @@ where
                                         &mut self.handler,
                                         req,
                                         typed_responder,
-                                        connection,
+                                        connection_context::from_raw::<Context, _>(connection),
                                     )
                                     .await?;
                                     match result.into_handled() {
@@ -183,16 +181,17 @@ pub struct NotificationHandler<
     Notif: JsonRpcNotification = UntypedMessage,
     F = (),
     ToFut = (),
+    Context = RawConnectionContext,
 > {
     counterpart: Counterpart,
     peer: Peer,
     handler: F,
     to_future_hack: ToFut,
-    phantom: PhantomData<fn(Notif)>,
+    phantom: PhantomData<fn(Notif, Context)>,
 }
 
-impl<Counterpart: Role, Peer: Role, Notif: JsonRpcNotification, F, ToFut>
-    NotificationHandler<Counterpart, Peer, Notif, F, ToFut>
+impl<Counterpart: Role, Peer: Role, Notif: JsonRpcNotification, F, ToFut, Context>
+    NotificationHandler<Counterpart, Peer, Notif, F, ToFut, Context>
 {
     /// Creates a new notification handler
     pub fn new(counterpart: Counterpart, peer: Peer, handler: F, to_future_hack: ToFut) -> Self {
@@ -206,17 +205,18 @@ impl<Counterpart: Role, Peer: Role, Notif: JsonRpcNotification, F, ToFut>
     }
 }
 
-impl<Counterpart: Role, Peer: Role, Notif, F, T, ToFut> HandleDispatchFrom<Counterpart>
-    for NotificationHandler<Counterpart, Peer, Notif, F, ToFut>
+impl<Counterpart: Role, Peer: Role, Notif, F, T, ToFut, Context> HandleDispatchFrom<Counterpart>
+    for NotificationHandler<Counterpart, Peer, Notif, F, ToFut, Context>
 where
     Counterpart: HasPeer<Peer>,
     Notif: JsonRpcNotification,
-    F: AsyncFnMut(Notif, ConnectionTo<Counterpart>) -> Result<T, crate::Error> + Send,
-    T: crate::IntoHandled<(Notif, ConnectionTo<Counterpart>)>,
+    Context: ConnectionContext,
+    F: AsyncFnMut(Notif, Context::Connection<Counterpart>) -> Result<T, crate::Error> + Send,
+    T: crate::IntoHandled<(Notif, Context::Connection<Counterpart>)>,
     ToFut: Fn(
             &mut F,
             Notif,
-            ConnectionTo<Counterpart>,
+            Context::Connection<Counterpart>,
         ) -> crate::BoxFuture<'_, Result<T, crate::Error>>
         + Send
         + Sync,
@@ -250,9 +250,12 @@ where
                                         ?notif,
                                         "NotificationHandler::handle_notification: parse completed"
                                     );
-                                    let result =
-                                        (self.to_future_hack)(&mut self.handler, notif, connection)
-                                            .await?;
+                                    let result = (self.to_future_hack)(
+                                        &mut self.handler,
+                                        notif,
+                                        connection_context::from_raw::<Context, _>(connection),
+                                    )
+                                    .await?;
                                     match result.into_handled() {
                                         Handled::Yes => Ok(Handled::Yes),
                                         Handled::No {
@@ -298,7 +301,7 @@ where
     }
 }
 
-/// Handler that handles both requests and notifications of specific types.
+/// Handler for typed requests, notifications, and matching responses.
 pub struct MessageHandler<
     Counterpart: Role,
     Peer: Role,
@@ -306,16 +309,24 @@ pub struct MessageHandler<
     Notif: JsonRpcNotification = UntypedMessage,
     F = (),
     ToFut = (),
+    Context = RawConnectionContext,
 > {
     counterpart: Counterpart,
     peer: Peer,
     handler: F,
     to_future_hack: ToFut,
-    phantom: PhantomData<fn(Dispatch<Req, Notif>)>,
+    phantom: PhantomData<fn(Dispatch<Req, Notif>, Context)>,
 }
 
-impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, Notif: JsonRpcNotification, F, ToFut>
-    MessageHandler<Counterpart, Peer, Req, Notif, F, ToFut>
+impl<
+    Counterpart: Role,
+    Peer: Role,
+    Req: JsonRpcRequest,
+    Notif: JsonRpcNotification,
+    F,
+    ToFut,
+    Context,
+> MessageHandler<Counterpart, Peer, Req, Notif, F, ToFut, Context>
 {
     /// Creates a new message handler
     pub fn new(counterpart: Counterpart, peer: Peer, handler: F, to_future_hack: ToFut) -> Self {
@@ -329,17 +340,30 @@ impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, Notif: JsonRpcNotificat
     }
 }
 
-impl<Counterpart: Role, Peer: Role, Req: JsonRpcRequest, Notif: JsonRpcNotification, F, T, ToFut>
-    HandleDispatchFrom<Counterpart> for MessageHandler<Counterpart, Peer, Req, Notif, F, ToFut>
+impl<
+    Counterpart: Role,
+    Peer: Role,
+    Req: JsonRpcRequest,
+    Notif: JsonRpcNotification,
+    F,
+    T,
+    ToFut,
+    Context,
+> HandleDispatchFrom<Counterpart>
+    for MessageHandler<Counterpart, Peer, Req, Notif, F, ToFut, Context>
 where
     Counterpart: HasPeer<Peer>,
-    F: AsyncFnMut(Dispatch<Req, Notif>, ConnectionTo<Counterpart>) -> Result<T, crate::Error>
+    Context: ConnectionContext,
+    F: AsyncFnMut(
+            Dispatch<Req, Notif>,
+            Context::Connection<Counterpart>,
+        ) -> Result<T, crate::Error>
         + Send,
     T: IntoHandled<Dispatch<Req, Notif>>,
     ToFut: Fn(
             &mut F,
             Dispatch<Req, Notif>,
-            ConnectionTo<Counterpart>,
+            Context::Connection<Counterpart>,
         ) -> crate::BoxFuture<'_, Result<T, crate::Error>>
         + Send
         + Sync,
@@ -364,9 +388,12 @@ where
             connection,
             async |dispatch, connection| match dispatch.into_typed_dispatch::<Req, Notif>()? {
                 Ok(typed_dispatch) => {
-                    let result =
-                        (self.to_future_hack)(&mut self.handler, typed_dispatch, connection)
-                            .await?;
+                    let result = (self.to_future_hack)(
+                        &mut self.handler,
+                        typed_dispatch,
+                        connection_context::from_raw::<Context, _>(connection),
+                    )
+                    .await?;
                     match result.into_handled() {
                         Handled::Yes => Ok(Handled::Yes),
                         Handled::No {
@@ -473,6 +500,21 @@ impl<H1, H2> ChainedHandler<H1, H2> {
     }
 }
 
+/// Heap-allocates a handler's dispatch future; `inline(never)` keeps its
+/// construction out of the caller's poll frame.
+#[inline(never)]
+fn boxed_dispatch<Counterpart, H>(
+    handler: &mut H,
+    message: Dispatch,
+    connection: ConnectionTo<Counterpart>,
+) -> crate::BoxFuture<'_, Result<Handled<Dispatch>, crate::Error>>
+where
+    Counterpart: Role,
+    H: HandleDispatchFrom<Counterpart>,
+{
+    Box::pin(handler.handle_dispatch_from(message, connection))
+}
+
 impl<Counterpart: Role, H1, H2> HandleDispatchFrom<Counterpart> for ChainedHandler<H1, H2>
 where
     H1: HandleDispatchFrom<Counterpart>,
@@ -491,20 +533,14 @@ where
         message: Dispatch,
         connection: ConnectionTo<Counterpart>,
     ) -> Result<Handled<Dispatch>, crate::Error> {
-        match self
-            .handler1
-            .handle_dispatch_from(message, connection.clone())
-            .await?
-        {
+        // Box each link so deep chains don't build one giant nested poll
+        // frame per handler and overflow small (e.g. GCD 512 KiB) stacks.
+        match boxed_dispatch(&mut self.handler1, message, connection.clone()).await? {
             Handled::Yes => Ok(Handled::Yes),
             Handled::No {
                 message,
                 retry: retry1,
-            } => match self
-                .handler2
-                .handle_dispatch_from(message, connection)
-                .await?
-            {
+            } => match boxed_dispatch(&mut self.handler2, message, connection).await? {
                 Handled::Yes => Ok(Handled::Yes),
                 Handled::No {
                     message,

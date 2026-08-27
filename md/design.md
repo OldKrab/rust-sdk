@@ -1,6 +1,6 @@
 # Core Library Design
 
-This document describes the design of the `agent-client-protocol` crate and its companion crates (`agent-client-protocol-tokio`, `agent-client-protocol-rmcp`).
+This document describes the design of the `agent-client-protocol` crate and its companion transport and integration crates.
 
 For API usage, see the [rustdoc](https://docs.rs/agent-client-protocol) and [cookbook](https://docs.rs/agent-client-protocol-cookbook).
 
@@ -14,14 +14,12 @@ The core SDK. Provides:
 - **Connection builders** (`builder()`, `connect_to()`, `connect_with()`)
 - **Message handling** (`on_receive_request`, `on_receive_notification`, `on_receive_dispatch`)
 - **Protocol types** (`agent_client_protocol::schema::*`) - all ACP message types
-- **MCP server attachment** - runtime-agnostic interfaces for wiring MCP servers into ACP sessions
+- **Transports and process launching** (`Channel`, `Lines`, `ByteStreams`, `Stdio`, `AcpAgent`)
+- **MCP server attachment** - runtime-agnostic interfaces for wiring MCP servers into ACP sessions through the opt-in `unstable_mcp_over_acp` transport
 
-### agent-client-protocol-tokio
+### agent-client-protocol-http
 
-Tokio-specific utilities:
-
-- **Process spawning** - spawn agent/proxy processes and connect via stdio
-- **Transport helpers** - convert tokio streams to ACP transports
+Optional HTTP/SSE and WebSocket clients and servers built on the core transport-frame boundary.
 
 ### agent-client-protocol-rmcp
 
@@ -29,6 +27,11 @@ Integration with the [rmcp](https://docs.rs/rmcp) crate:
 
 - **`McpServer::builder()`** - define MCP tools in Rust code
 - **`McpServer::from_rmcp()`** - wrap an rmcp server as an ACP MCP server
+
+Standalone rmcp-backed servers need no ACP transport feature. Enable the
+integration crate's `unstable_mcp_over_acp` feature to advertise an attached
+server as `McpServer::Acp`. Agents limited to HTTP MCP transports require the
+separate compatibility polyfill.
 
 ## Role System
 
@@ -89,7 +92,7 @@ sequenceDiagram
     participant Handlers
     participant UserCode
 
-    Transport->>DispatchLoop: incoming JSON-RPC message
+    Transport->>DispatchLoop: incoming TransportFrame
     DispatchLoop->>Handlers: try handlers in order
 
     alt Handler matches
@@ -144,9 +147,20 @@ stateDiagram-v2
 
 ### Two Connection Modes
 
-**Reactive mode** (`connect_to`): The connection runs handlers until the transport closes. Used for agents and proxies.
+**Reactive mode** (`connect_to`): The connection runs handlers until the incoming transport reaches clean EOF, drains responses and notifications already accepted by the outgoing queue through the transport sink, then returns `Ok(())`, including when the builder has long-running `with_spawned` work. Used for agents and proxies.
 
-**Active mode** (`connect_with`): Runs a closure with access to the connection, then closes. Used for clients that drive the interaction.
+**Active mode** (`connect_with`): Runs a closure with access to the connection, then closes. Used for clients that drive the interaction. Incoming EOF fails requests that still need responses, but it does not automatically cancel unrelated work in the closure.
+
+### Clean Incoming EOF
+
+Incoming EOF is a connection event and a request-liveness boundary:
+
+- Every pending request is completed with an internal error whose data identifies `incoming_transport_closed` and the request method; `is_incoming_transport_closed()` detects it.
+- A request created after EOF fails immediately with the same error.
+- `ConnectionTo::incoming_closed()` waits for the close event, and `is_incoming_closed()` reports whether it has completed.
+- `Builder::on_close()` runs cleanup callbacks in registration order. Returning an error terminates a still-running `connect_with` foreground; returning `Ok(())` leaves its lifetime under application control.
+
+This keeps request correctness separate from async cancellation policy. Applications can finish cleanup or notify a central dispatcher without having an arbitrary foreground future dropped at an await point. Pending requests are failed before close callbacks begin; the close signal is published after callbacks finish, so a callback must not await `incoming_closed()` itself.
 
 ## Key Source Files
 
@@ -154,9 +168,11 @@ stateDiagram-v2
 | -------------------------------------------- | ------------------------------------- |
 | `src/agent-client-protocol/src/role.rs`      | Role trait and type definitions       |
 | `src/agent-client-protocol/src/role/acp.rs`  | Client, Agent, Proxy, Conductor roles |
-| `src/agent-client-protocol/src/component.rs` | ConnectTo and Builder traits          |
-| `src/agent-client-protocol/src/handler.rs`   | Connection builder implementation     |
-| `src/agent-client-protocol/src/typed.rs`     | Dispatch type and handler matching    |
+| `src/agent-client-protocol/src/component.rs` | `ConnectTo` component abstraction     |
+| `src/agent-client-protocol/src/jsonrpc.rs`  | Connection builder and frame types    |
+| `src/agent-client-protocol/src/jsonrpc/handlers.rs` | Handler chain implementation  |
+| `src/agent-client-protocol/src/jsonrpc/transport_actor.rs` | Line framing and JSON parsing |
+| `src/agent-client-protocol/src/util/typed.rs` | Dispatch typing and matching helpers |
 | `src/agent-client-protocol/src/mcp_server/`  | Runtime-agnostic MCP server attachment |
 | `src/agent-client-protocol/src/concepts/`    | Rustdoc concept explanations          |
 

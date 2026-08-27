@@ -1,6 +1,4 @@
-use agent_client_protocol::{
-    ConnectTo, Dispatch, DynConnectTo, role::mcp, schema::McpDisconnectNotification,
-};
+use agent_client_protocol::{ConnectTo, Dispatch, DynConnectTo, role::mcp};
 use futures::{SinkExt as _, StreamExt as _, channel::mpsc};
 use tracing::info;
 
@@ -10,10 +8,10 @@ use super::BridgeMessage;
 /// and the ACP proxy chain.
 #[derive(Debug)]
 pub(crate) struct BridgeConnectionActor {
-    /// How to connect to the MCP server (e.g., stdio or HTTP transport).
+    /// The loopback HTTP transport accepted by the compatibility listener.
     transport: DynConnectTo<mcp::Client>,
 
-    /// Sender for messages back to the polyfill's bridge responder loop.
+    /// Sender for messages back to the polyfill's bridge runner loop.
     bridge_tx: mpsc::Sender<BridgeMessage>,
 
     /// Receiver for messages from the polyfill to forward to the MCP client.
@@ -71,12 +69,7 @@ impl BridgeConnectionActor {
             .await;
 
         bridge_tx
-            .send(BridgeMessage::Disconnected {
-                notification: McpDisconnectNotification {
-                    connection_id,
-                    meta: None,
-                },
-            })
+            .send(BridgeMessage::Disconnected { connection_id })
             .await
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
